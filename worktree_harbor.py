@@ -41,6 +41,7 @@ EDITOR_CANDIDATES = (
     {"id": "webstorm", "label": "WebStorm", "app_names": ("WebStorm", "WebStorm EAP"), "bundle_ids": ("com.jetbrains.WebStorm", "com.jetbrains.WebStorm-EAP")},
     {"id": "intellij", "label": "IntelliJ IDEA", "app_names": ("IntelliJ IDEA", "IntelliJ IDEA CE"), "bundle_ids": ("com.jetbrains.intellij", "com.jetbrains.intellij.ce")},
 )
+IS_WINDOWS = sys.platform == "win32"
 
 
 def classify_branch(branch: str) -> str:
@@ -95,6 +96,15 @@ def git(repo: Path, *args: str, timeout: int = 15, check: bool = False) -> CmdRe
 
 def clean_path(value: str) -> Path:
     return Path(os.path.expandvars(os.path.expanduser(value))).resolve()
+
+
+def open_external_url(url: str) -> None:
+    if sys.platform == "darwin":
+        result = run(("open", url))
+        if result.code != 0:
+            raise HarborError(result.stderr or "无法打开浏览器")
+    elif not webbrowser.open(url):
+        raise HarborError("无法打开浏览器")
 
 
 def read_config() -> Dict[str, object]:
@@ -591,6 +601,8 @@ class Harbor:
 
     @staticmethod
     def app_available(name: str) -> bool:
+        if IS_WINDOWS:
+            return bool(shutil.which(name))
         return any(path.is_dir() for path in (
             Path("/Applications") / f"{name}.app",
             Path.home() / "Applications" / f"{name}.app",
@@ -598,6 +610,34 @@ class Harbor:
 
     @staticmethod
     def editor_path(candidate: Dict[str, object]) -> Optional[Path]:
+        if IS_WINDOWS:
+            command_names = {
+                "cursor": ("cursor", "Cursor.exe"),
+                "vscode": ("code", "Code.exe"),
+                "webstorm": ("webstorm64.exe", "webstorm"),
+                "intellij": ("idea64.exe", "idea"),
+            }
+            editor_id = str(candidate["id"])
+            for command in command_names.get(editor_id, ()):
+                located = shutil.which(command)
+                if located:
+                    return Path(located)
+            local = Path(os.environ.get("LOCALAPPDATA", ""))
+            program_files = [Path(os.environ.get(name, "")) for name in ("ProgramFiles", "ProgramFiles(x86)")]
+            known = {
+                "cursor": [local / "Programs" / "cursor" / "Cursor.exe"],
+                "vscode": [local / "Programs" / "Microsoft VS Code" / "Code.exe"] + [base / "Microsoft VS Code" / "Code.exe" for base in program_files],
+            }
+            for path in known.get(editor_id, []):
+                if path.is_file():
+                    return path
+            toolbox = local / "JetBrains" / "Toolbox" / "apps"
+            executable = "webstorm64.exe" if editor_id == "webstorm" else "idea64.exe" if editor_id == "intellij" else ""
+            if executable and toolbox.is_dir():
+                match = next(toolbox.rglob(executable), None)
+                if match and match.is_file():
+                    return match
+            return None
         for app_name in candidate["app_names"]:
             for path in (Path("/Applications") / f"{app_name}.app", Path.home() / "Applications" / f"{app_name}.app"):
                 if path.is_dir():
@@ -712,6 +752,18 @@ class Harbor:
 
     @staticmethod
     def choose_import_directory() -> Optional[Path]:
+        if IS_WINDOWS:
+            try:
+                import tkinter as tk
+                from tkinter import filedialog
+                root = tk.Tk()
+                root.withdraw()
+                root.attributes("-topmost", True)
+                selected = filedialog.askdirectory(title="选择要导入的 Git 项目或工作区目录")
+                root.destroy()
+                return clean_path(selected) if selected else None
+            except Exception as exc:
+                raise HarborError(f"无法打开文件夹选择器：{exc}") from exc
         result = run((
             "osascript",
             "-e", 'set selectedFolder to choose folder with prompt "选择要导入的 Git 项目或工作区目录"',
@@ -763,6 +815,16 @@ class Harbor:
 
     @staticmethod
     def wechat_cli_path() -> str:
+        if IS_WINDOWS:
+            candidates = [
+                Path(os.environ.get("ProgramFiles(x86)", "")) / "Tencent" / "微信web开发者工具" / "cli.bat",
+                Path(os.environ.get("ProgramFiles", "")) / "Tencent" / "微信web开发者工具" / "cli.bat",
+                Path(os.environ.get("LOCALAPPDATA", "")) / "微信开发者工具" / "cli.bat",
+            ]
+            for candidate in candidates:
+                if candidate.is_file():
+                    return str(candidate)
+            raise HarborError("未找到微信开发者工具，请先安装后再试")
         candidates = [
             Path("/Applications/wechatwebdevtools.app/Contents/MacOS/cli"),
             Path.home() / "Applications" / "wechatwebdevtools.app" / "Contents" / "MacOS" / "cli",
@@ -840,9 +902,7 @@ class Harbor:
             existing = self.web_preview
         if existing and existing[0].poll() is None and existing[2] == target and existing[3] == environment:
             url = existing[1]
-            result = run(("open", url))
-            if result.code != 0:
-                raise HarborError(result.stderr or "无法打开浏览器")
+            open_external_url(url)
             return f"已重新打开{environment_label}环境网页：{url}"
 
         replacing_live_preview = bool(existing and existing[0].poll() is None)
@@ -870,15 +930,16 @@ class Harbor:
         command.extend(script_args)
         command.extend(["--host", "127.0.0.1", "--port", str(port)])
         try:
-            process = subprocess.Popen(
-                command,
-                cwd=str(target),
-                stdin=subprocess.DEVNULL,
-                stdout=subprocess.DEVNULL,
-                stderr=subprocess.DEVNULL,
-                start_new_session=True,
-                env={**os.environ, "BROWSER": "none"},
-            )
+            process_options = {
+                "cwd": str(target), "stdin": subprocess.DEVNULL,
+                "stdout": subprocess.DEVNULL, "stderr": subprocess.DEVNULL,
+                "env": {**os.environ, "BROWSER": "none"},
+            }
+            if IS_WINDOWS:
+                process_options["creationflags"] = subprocess.CREATE_NEW_PROCESS_GROUP
+            else:
+                process_options["start_new_session"] = True
+            process = subprocess.Popen(command, **process_options)
         except Exception:
             self.release_borrowed_dependencies(borrowed_dependencies)
             raise
@@ -899,19 +960,14 @@ class Harbor:
             except OSError:
                 time.sleep(0.15)
         else:
-            try:
-                os.killpg(process.pid, signal.SIGTERM)
-            except (OSError, ProcessLookupError):
-                pass
+            self.stop_preview_process(process)
             with self.lock:
                 if self.web_preview and self.web_preview[0] is process:
                     self.web_preview = None
             self.release_borrowed_dependencies(borrowed_dependencies)
             raise HarborError(f"{environment_label}环境网页启动超时，请在编辑器终端运行 pnpm run {script} 检查")
         if not replacing_live_preview:
-            result = run(("open", url))
-            if result.code != 0:
-                raise HarborError(result.stderr or "无法打开浏览器")
+            open_external_url(url)
         if replacing_live_preview:
             return f"已用当前工作树的{environment_label}环境替换上一个网页预览：{url}"
         return f"已启动当前工作树的{environment_label}环境网页：{url}"
@@ -919,6 +975,9 @@ class Harbor:
     @staticmethod
     def stop_preview_process(process: subprocess.Popen) -> None:
         if process.poll() is not None:
+            return
+        if IS_WINDOWS:
+            run(("taskkill", "/PID", str(process.pid), "/T", "/F"), timeout=10)
             return
         try:
             os.killpg(process.pid, signal.SIGTERM)
@@ -993,15 +1052,24 @@ class Harbor:
             editor = self.preferred_editor(repo_id=str(payload.get("repo_id", "")))
             if not editor:
                 raise HarborError("未找到可用编辑器，请安装 Cursor、Visual Studio Code、WebStorm 或 IntelliJ IDEA")
-            result = run(("open", "-a", editor["app_name"], str(target)))
-            if result.code != 0:
-                raise HarborError(result.stderr or "无法在编辑器中打开")
+            if IS_WINDOWS:
+                try:
+                    subprocess.Popen([editor["path"], str(target)], close_fds=True)
+                except OSError as exc:
+                    raise HarborError(f"无法在编辑器中打开：{exc}") from exc
+            else:
+                result = run(("open", "-a", editor["app_name"], str(target)))
+                if result.code != 0:
+                    raise HarborError(result.stderr or "无法在编辑器中打开")
             return {"message": f"已使用 {editor['label']} 打开 {target.name}"}
         if action == "open_folder":
             target = self.registered_worktree(repo, str(payload.get("path", "")))
-            result = run(("open", str(target)))
-            if result.code != 0:
-                raise HarborError(result.stderr or "无法打开工作树目录")
+            if IS_WINDOWS:
+                os.startfile(str(target))
+            else:
+                result = run(("open", str(target)))
+                if result.code != 0:
+                    raise HarborError(result.stderr or "无法打开工作树目录")
             return {"message": f"已打开 {target.name} 文件夹"}
         if action in {"open_wechat", "open_wechat_test", "open_wechat_production"}:
             target = self.registered_worktree(repo, str(payload.get("path", "")))
@@ -1016,12 +1084,18 @@ class Harbor:
             return {"message": self.open_web_preview(target, environment, repo)}
         if action == "reveal":
             target = self.registered_worktree(repo, str(payload.get("path", "")))
+            if IS_WINDOWS:
+                subprocess.Popen(["explorer.exe", "/select,", str(target)])
+                return {"message": "已在资源管理器中显示工作树目录"}
             result = run(("open", "-R", str(target)))
             if result.code != 0:
                 raise HarborError(result.stderr or "无法在访达中显示目录")
             return {"message": "已在访达中显示工作树目录"}
         if action == "open_terminal":
             target = self.registered_worktree(repo, str(payload.get("path", "")))
+            if IS_WINDOWS:
+                subprocess.Popen(["cmd.exe", "/K", "cd", "/d", str(target)], creationflags=subprocess.CREATE_NEW_CONSOLE)
+                return {"message": f"已在 {target.name} 目录打开终端"}
             result = run(("open", "-a", "Terminal", str(target)))
             if result.code != 0:
                 raise HarborError(result.stderr or "无法打开终端")

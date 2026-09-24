@@ -1,0 +1,87 @@
+name: Build desktop installers
+
+on:
+  push:
+    tags:
+      - "v*"
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  windows:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - name: Install build tools
+        run: |
+          python -m pip install --upgrade pip
+          python -m pip install pyinstaller pywebview
+          choco install innosetup -y --no-progress
+      - name: Build desktop executable
+        run: >-
+          pyinstaller --noconfirm --clean --onefile --windowed
+          --name WorktreeHub --paths . --add-data "static;static"
+          --collect-all webview windows/worktree_hub.py
+      - name: Build Windows installer
+        shell: pwsh
+        run: |
+          $version = "${env:GITHUB_REF_NAME}" -replace '^v',''
+          if (-not $version -or $version -eq $env:GITHUB_REF_NAME) { $version = "1.0.0" }
+          & "C:\Program Files (x86)\Inno Setup 6\ISCC.exe" "/DMyAppVersion=$version" "windows\WorktreeHub.iss"
+      - uses: actions/upload-artifact@v4
+        with:
+          name: windows-installer
+          path: installer/Worktree-Hub-Windows-x64-Setup.exe
+
+  macos:
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - runner: macos-15
+            arch: arm64
+          - runner: macos-15-intel
+            arch: x64
+    runs-on: ${{ matrix.runner }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - name: Install PyInstaller
+        run: python3 -m pip install --upgrade pyinstaller
+      - name: Build bundled backend
+        run: pyinstaller --noconfirm --clean --onefile --name worktree_harbor_backend --add-data "static:static" worktree_harbor.py
+      - name: Build macOS application
+        run: |
+          mkdir -p release
+          chmod +x build-macos-app.sh build-macos-dmg.sh
+          HARBOR_BACKEND_EXECUTABLE="$PWD/dist/worktree_harbor_backend" WORKTREE_HUB_APP_PATH="$PWD/release/Worktree Hub.app" ./build-macos-app.sh
+      - name: Build disk image
+        run: WORKTREE_HUB_APP_PATH="$PWD/release/Worktree Hub.app" WORKTREE_HUB_ARCH="${{ matrix.arch }}" WORKTREE_HUB_DMG_PATH="$PWD/release/Worktree-Hub-macOS-${{ matrix.arch }}.dmg" ./build-macos-dmg.sh
+      - uses: actions/upload-artifact@v4
+        with:
+          name: macos-${{ matrix.arch }}
+          path: release/Worktree-Hub-macOS-${{ matrix.arch }}.dmg
+
+  release:
+    if: startsWith(github.ref, 'refs/tags/')
+    needs: [windows, macos]
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          path: release
+          merge-multiple: true
+      - name: Publish GitHub Release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: >-
+          gh release create "$GITHUB_REF_NAME" release/*
+          --repo "$GITHUB_REPOSITORY" --generate-notes
+          --title "Worktree Hub $GITHUB_REF_NAME"

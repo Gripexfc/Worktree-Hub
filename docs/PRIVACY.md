@@ -25,10 +25,10 @@ Worktree Hub 采用本地优先设计。
 macOS 应用把扫描目录和编辑器偏好保存在：
 
 ```text
-~/Library/Application Support/Worktree Harbor/config.json
+~/Library/Application Support/Worktree Hub/config.json
 ```
 
-直接运行源码时，配置默认保存在项目目录的 `.data/config.json`。删除这些文件即可清除 Worktree Hub 保存的设置。
+Windows 安装版保存在 `%LOCALAPPDATA%\Worktree Hub\config.json`。直接运行源码时，配置默认保存在项目目录的 `.data/config.json`。删除这些文件即可清除 Worktree Hub 保存的设置。
 
 ## 本地服务
 

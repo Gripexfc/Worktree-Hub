@@ -19,6 +19,9 @@ htmlcov/
 *.app/
 build/
 dist/
+installer/
+release/
+*.spec
 
 # Logs and temporary files
 *.log

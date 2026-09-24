@@ -39,6 +39,19 @@ class CoreTests(unittest.TestCase):
         self.assertIn("window?.performDrag(with: event)", swift)
         self.assertIn("container.addSubview(dragView)", swift)
 
+    def test_release_builds_mac_and_windows_installers(self):
+        root = Path(__file__).resolve().parents[1]
+        workflow = (root / ".github" / "workflows" / "release.yml").read_text()
+        windows = (root / "windows" / "worktree_hub.py").read_text()
+        backend = (root / "worktree_harbor.py").read_text()
+        self.assertIn("Worktree-Hub-Windows-x64-Setup.exe", workflow)
+        self.assertIn("arch: arm64", workflow)
+        self.assertIn("arch: x64", workflow)
+        self.assertIn("Worktree-Hub-macOS-${{ matrix.arch }}.dmg", workflow)
+        self.assertIn('webview.create_window("Worktree Hub"', windows)
+        self.assertIn('if IS_WINDOWS:', backend)
+        self.assertIn('os.startfile(str(target))', backend)
+
     def test_sidebar_filter_cluster_is_removed(self):
         root = Path(__file__).resolve().parents[1]
         html = (root / "static" / "index.html").read_text()

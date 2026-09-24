@@ -45,7 +45,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, WKNavigationDelegate {
             backing: .buffered,
             defer: false
         )
-        window.title = "工作树管家"
+        window.title = "Worktree Hub"
         window.titlebarAppearsTransparent = true
         window.titleVisibility = .hidden
         window.isMovableByWindowBackground = true
@@ -111,18 +111,30 @@ final class AppDelegate: NSObject, NSApplicationDelegate, WKNavigationDelegate {
         }
 
         let supportBase = FileManager.default.urls(for: .applicationSupportDirectory, in: .userDomainMask).first!
-        let support = supportBase.appendingPathComponent("Worktree Harbor", isDirectory: true)
+        let support = supportBase.appendingPathComponent("Worktree Hub", isDirectory: true)
         do {
             try FileManager.default.createDirectory(at: support, withIntermediateDirectories: true)
+            let newConfig = support.appendingPathComponent("config.json")
+            let legacyConfig = supportBase.appendingPathComponent("Worktree Harbor/config.json")
+            if !FileManager.default.fileExists(atPath: newConfig.path),
+               FileManager.default.fileExists(atPath: legacyConfig.path) {
+                try FileManager.default.copyItem(at: legacyConfig, to: newConfig)
+            }
         } catch {
             showError("无法创建配置目录")
             return
         }
 
+        let bundledBackend = resources.appendingPathComponent("worktree_harbor_backend")
         let process = Process()
         let pipe = Pipe()
-        process.executableURL = URL(fileURLWithPath: "/usr/bin/python3")
-        process.arguments = [script.path, "--no-browser", "--host", "127.0.0.1", "--port", "0"]
+        if FileManager.default.isExecutableFile(atPath: bundledBackend.path) {
+            process.executableURL = bundledBackend
+            process.arguments = ["--no-browser", "--host", "127.0.0.1", "--port", "0"]
+        } else {
+            process.executableURL = URL(fileURLWithPath: "/usr/bin/python3")
+            process.arguments = [script.path, "--no-browser", "--host", "127.0.0.1", "--port", "0"]
+        }
         process.currentDirectoryURL = resources
         process.standardOutput = pipe
         process.standardError = pipe

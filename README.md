@@ -30,14 +30,24 @@ Worktree Hub 的界面服务仅监听 `127.0.0.1`，修改请求需要当前进�
 
 需要注意：当你主动点击 Web、小程序或编辑器入口时，Worktree Hub 会启动对应的本地第三方软件或项目脚本。这些软件和脚本是否联网由它们自己的实现与配置决定，不属于 Worktree Hub 的数据传输。完整说明见 [隐私说明](docs/PRIVACY.md)。
 
+## 下载安装包
+
+打开 [GitHub Releases](https://github.com/Gripexfc/Worktree-Hub/releases) 下载对应系统版本：
+
+- `Worktree-Hub-Windows-x64-Setup.exe`：Windows 10/11 64 位
+- `Worktree-Hub-macOS-arm64.dmg`：Apple 芯片 Mac
+- `Worktree-Hub-macOS-x64.dmg`：Intel Mac
+
+Windows 安装版和 macOS 安装版均已包含 Python 运行时，不需要单独安装 Python。当前安装包未购买商业代码签名证书；Windows SmartScreen 或 macOS Gatekeeper 可能显示来源提示，请只从本仓库 Release 页面下载。
+
 ## 系统要求
 
 原生桌面版目前面向 macOS：
 
 - macOS 13 或更高版本
 - Git
-- Python 3（macOS 系统自带版本即可）
-- 构建 `.app` 时需要 Xcode Command Line Tools
+- 从源码运行时需要 Python 3
+- 自行构建 `.app` 时需要 Xcode Command Line Tools
 
 以下工具均为可选：
 
@@ -66,14 +76,15 @@ python3 worktree_harbor.py --root /path/to/projects --root /another/path
 ```bash
 xcode-select --install  # 尚未安装命令行工具时执行
 ./build-macos-app.sh
-open "../Worktree Harbor.app"
+open "../Worktree Hub.app"
 ```
 
-构建脚本会在源码目录的上一级生成 `Worktree Harbor.app`，并使用本机临时签名。临时签名适合本机运行；向其他人正式分发时，建议使用 Apple Developer ID 签名并进行公证。
+构建脚本会在源码目录的上一级生成 `Worktree Hub.app`，并使用本机临时签名。Release 工作流会额外把 Python 后端打入应用并生成 DMG。临时签名适合测试分发；正式商用分发建议使用 Apple Developer ID 签名并公证。
 
 ## 配置位置
 
-- macOS 应用：`~/Library/Application Support/Worktree Harbor/config.json`
+- macOS 应用：`~/Library/Application Support/Worktree Hub/config.json`
+- Windows 应用：`%LOCALAPPDATA%\Worktree Hub\config.json`
 - 直接运行源码：项目目录下的 `.data/config.json`
 
 这些文件包含用户选择的扫描目录和仓库编辑器偏好，不应提交到 Git。仓库已通过 `.gitignore` 排除它们。
