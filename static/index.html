@@ -1,0 +1,86 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width,initial-scale=1">
+  <meta name="color-scheme" content="dark">
+  <title>工作树管家</title>
+  <link rel="stylesheet" href="/styles.css">
+  <link rel="stylesheet" href="/priorities.css">
+</head>
+<body>
+  <div class="shell">
+    <aside class="sidebar">
+      <div class="brand"><span class="brand-mark">树</span><div><strong>工作树管家</strong><small>多项目工作区管理</small></div></div>
+      <div class="nav-section-label">工作区</div>
+      <div id="workspace-nav" class="workspace-nav"></div>
+      <div class="sidebar-footer">
+        <button class="secondary wide" id="environment-check-button">环境检测</button>
+        <button class="secondary wide" id="settings-button">扫描设置</button>
+        <p>本地运行 · 不上传仓库数据</p>
+      </div>
+    </aside>
+    <main>
+      <header>
+        <div><p class="eyebrow">工作树清理</p><h1>清理工作区</h1><p class="subtitle" id="scan-summary">正在扫描项目…</p></div>
+        <div class="header-actions"><button class="secondary import-directory" id="import-directory">＋ 导入目录</button><label class="search"><span>⌕</span><input id="search" placeholder="搜索项目或分支 · ⌘K"></label><button class="secondary select-current" id="select-visible">全选当前</button><button class="secondary icon-refresh" id="refresh" title="刷新 · ⌘R">↻</button><button class="primary cleanup-primary" id="cleanup-button"><span id="cleanup-button-label">建议</span> <b id="cleanup-button-count">0</b></button></div>
+      </header>
+      <section class="selection-bar" id="selection-bar">
+        <div class="selection-summary"><span class="selection-check">✓</span><strong id="selection-count">0</strong><span id="selection-detail">个工作树已选择</span></div>
+        <div><button class="secondary" id="clear-selection">取消选择</button><button class="danger" id="remove-selected" disabled>删除所选</button></div>
+      </section>
+      <section class="stats" id="stats">
+        <article class="stat skeleton"><span>正在读取仓库</span><strong>…</strong><small>本地状态</small></article>
+        <article class="stat skeleton"><span>正在检查改动</span><strong>…</strong><small>不会修改文件</small></article>
+        <article class="stat skeleton"><span>正在计算活跃度</span><strong>…</strong><small>请稍候</small></article>
+        <article class="stat skeleton"><span>正在整理顺序</span><strong>…</strong><small>约需数秒</small></article>
+      </section>
+      <section class="notice hidden" id="empty-notice"></section>
+      <section id="repositories" class="repositories"><div class="scan-placeholder"><span class="scan-spinner"></span><div><strong>正在扫描本地工作树</strong><p>仓库较多时约需 10–15 秒，只读取版本库状态，不会联网获取、合并或修改文件。</p></div></div></section>
+    </main>
+  </div>
+
+  <div class="toast-area" id="toast-area"></div>
+
+  <dialog id="settings-dialog">
+    <form method="dialog" class="dialog-card" id="settings-form">
+      <div class="dialog-head"><div><p class="eyebrow">设置</p><h2>扫描范围</h2></div><button class="icon-button" value="cancel" aria-label="关闭">×</button></div>
+      <label>项目根目录 <small>每行一个，工具会查找其中的版本库</small><textarea id="roots" rows="6" spellcheck="false"></textarea></label>
+      <div class="form-grid"><label>扫描深度<input id="max-depth" type="number" min="1" max="12"></label><label>陈旧阈值（天）<input id="stale-days" type="number" min="1" max="3650"></label></div>
+      <div class="dialog-actions"><button class="secondary" value="cancel">取消</button><button class="primary" id="save-settings" value="default">保存并重新扫描</button></div>
+    </form>
+  </dialog>
+
+  <dialog id="environment-dialog">
+    <div class="dialog-card environment-card">
+      <div class="dialog-head"><div><p class="eyebrow">首次启动</p><h2>运行环境检测</h2><p class="dialog-copy">检查本机工具是否可以支持工作树管理、代码编辑和项目预览。</p></div><button class="icon-button" id="close-environment" type="button" aria-label="关闭">×</button></div>
+      <div class="environment-summary" id="environment-summary">正在检测本机环境…</div>
+      <div class="environment-list" id="environment-list"></div>
+      <p class="environment-note">可选工具缺失不会影响工作树管理，对应功能会暂时不可用。</p>
+      <div class="dialog-actions"><button class="secondary" id="rerun-environment" type="button">重新检测</button><button class="primary" id="complete-environment" type="button">开始使用</button></div>
+    </div>
+  </dialog>
+
+  <dialog id="create-dialog">
+    <form method="dialog" class="dialog-card" id="create-form">
+      <div class="dialog-head"><div><p class="eyebrow">新建工作树</p><h2>创建隔离工作区</h2></div><button class="icon-button" value="cancel">×</button></div>
+      <label>仓库<select id="create-repo"></select></label>
+      <label>分支名<input id="create-branch" required placeholder="fix/issue-name" spellcheck="false"></label>
+      <label>基准引用 <small>已有本地分支时将直接使用；新分支可填写远端分支名</small><input id="create-base" required placeholder="例如：origin/main" spellcheck="false"></label>
+      <label>目标目录 <small>留空时自动放入主仓库旁的 .worktrees/仓库名/</small><input id="create-destination" placeholder="自动生成" spellcheck="false"></label>
+      <div class="dialog-actions"><button class="secondary" value="cancel">取消</button><button class="primary" id="confirm-create" value="default">创建</button></div>
+    </form>
+  </dialog>
+
+  <dialog id="remove-dialog">
+    <form method="dialog" class="dialog-card compact" id="remove-form">
+      <div class="dialog-head"><div><p class="eyebrow">删除工作树</p><h2 id="remove-title">删除工作树</h2></div><button class="icon-button" id="close-remove" type="button">×</button></div>
+      <div class="remove-warning" id="remove-warning"></div>
+      <p class="dialog-copy" id="remove-path"></p>
+      <div class="dialog-actions"><button class="secondary" id="cancel-remove" type="button">取消</button><button class="danger" id="confirm-remove" type="button">确认删除</button></div>
+    </form>
+  </dialog>
+
+  <script src="/app.js"></script>
+</body>
+</html>

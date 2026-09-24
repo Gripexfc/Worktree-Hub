@@ -1,0 +1,27 @@
+# Local configuration and user paths
+.data/
+config.json
+
+# Python
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.coverage
+htmlcov/
+
+# macOS and IDE metadata
+.DS_Store
+.idea/
+.vscode/
+*.xcuserstate
+
+# Build products
+*.app/
+build/
+dist/
+
+# Logs and temporary files
+*.log
+*.tmp
+*.swp
+*~
