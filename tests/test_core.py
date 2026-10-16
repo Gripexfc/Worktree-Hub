@@ -7,7 +7,7 @@ from pathlib import Path
 import sys
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
-from worktree_harbor import BRANCH_RE, CmdResult, Harbor, classify_branch, core_branches_for, discover_repositories, enrich_worktree, miniapp_project_for, parse_worktree_porcelain, preview_kind_for, run, status_for, web_preview_script
+from worktree_harbor import BRANCH_RE, CmdResult, Harbor, HarborError, classify_branch, core_branches_for, discover_repositories, enrich_worktree, miniapp_project_for, parse_worktree_porcelain, preview_kind_for, run, status_for, web_preview_script
 
 
 class CoreTests(unittest.TestCase):
@@ -20,6 +20,15 @@ class CoreTests(unittest.TestCase):
         self.assertIn('id="confirm-remove" type="button"', html)
         self.assertIn('$("#confirm-remove").addEventListener("click",confirmPendingRemoval)', script)
         self.assertIn('$("#remove-form").addEventListener("submit",e=>e.preventDefault())', script)
+
+    def test_settings_close_controls_do_not_trigger_rescan(self):
+        root = Path(__file__).resolve().parents[1]
+        html = (root / "static" / "index.html").read_text()
+        script = (root / "static" / "app.js").read_text()
+        self.assertIn('id="close-settings" type="button"', html)
+        self.assertIn('id="cancel-settings" type="button"', html)
+        self.assertIn('$("#settings-dialog").addEventListener("cancel",closeSettingsDialog)', script)
+        self.assertIn('if(e.submitter?.value==="cancel"){closeSettingsDialog();return;}', script)
 
     def test_main_directory_is_first_and_base_source_copy_is_explicit(self):
         root = Path(__file__).resolve().parents[1]
@@ -108,25 +117,34 @@ class CoreTests(unittest.TestCase):
                 self.assertIn(resolved_external, harbor.config["roots"])
                 write.assert_called_once()
 
-    def test_import_directory_button_uses_native_picker_action(self):
+    def test_import_directory_button_is_removed_but_native_picker_remains_available(self):
         root = Path(__file__).resolve().parents[1]
         html = (root / "static" / "index.html").read_text()
         script = (root / "static" / "app.js").read_text()
         backend = (root / "worktree_harbor.py").read_text()
-        self.assertIn('id="import-directory"', html)
-        self.assertIn('action:"import_directory"', script)
+        self.assertNotIn('id="import-directory"', html)
+        self.assertNotIn("#import-directory", script)
         self.assertIn('if action == "import_directory":', backend)
         self.assertIn('choose folder with prompt', backend)
 
-    def test_cleanup_filter_can_exit_and_zero_count_cannot_trap_page(self):
+    def test_cleanup_button_is_removed_while_cleanup_count_stays_visible(self):
         root = Path(__file__).resolve().parents[1]
         html = (root / "static" / "index.html").read_text()
         script = (root / "static" / "app.js").read_text()
-        self.assertIn('id="cleanup-button-label"', html)
-        self.assertIn('if(activeFilter==="cleanup"&&c.cleanup===0)activeFilter="all"', script)
-        self.assertIn('$("#cleanup-button").disabled=c.cleanup===0', script)
-        self.assertIn('setFilter(activeFilter==="cleanup"?"all":"cleanup")', script)
+        self.assertNotIn('id="cleanup-button"', html)
+        self.assertNotIn("cleanup-button", script)
+        self.assertIn('["建议清理",c.cleanup,"陈旧或失效","calm"]', script)
         self.assertIn('if(workspace){activeFilter="all";', script)
+
+    def test_search_normalizes_multiple_tokens_and_debounces_render(self):
+        root = Path(__file__).resolve().parents[1]
+        html = (root / "static" / "index.html").read_text()
+        script = (root / "static" / "app.js").read_text()
+        self.assertNotIn('id="paste-search"', html)
+        self.assertIn("function searchTokens(value)", script)
+        self.assertIn("tokens.every(token => searchable.includes(token))", script)
+        self.assertIn("window.setTimeout(() => render(), 80)", script)
+        self.assertNotIn("navigator.clipboard", script)
 
     def test_first_launch_environment_check_is_available(self):
         root = Path(__file__).resolve().parents[1]
@@ -163,6 +181,16 @@ class CoreTests(unittest.TestCase):
         self.assertIn("def set_repo_editor", backend)
         self.assertIn("repo_editors[repo_id] = editor_id", backend)
         self.assertIn('self.preferred_editor(editors, str(repository["id"]))', backend)
+
+    def test_repository_branch_rules_are_editable_per_project(self):
+        root = Path(__file__).resolve().parents[1]
+        script = (root / "static" / "app.js").read_text()
+        backend = (root / "worktree_harbor.py").read_text()
+        self.assertIn("data-save-branch-config", script)
+        self.assertIn('action:"set_repo_branches"', script)
+        self.assertIn("branch_options", backend)
+        self.assertIn("def set_repo_branches", backend)
+        self.assertIn('"repo_branches": {}', backend)
 
     def test_parse_worktrees(self):
         data = "worktree /tmp/main\nHEAD abc\nbranch refs/heads/main\n\nworktree /tmp/fix\nHEAD def\ndetached\nlocked building\n\n"
@@ -201,6 +229,33 @@ class CoreTests(unittest.TestCase):
             run(["git", "-C", str(repo), "branch", "team_master"])
             run(["git", "-C", str(repo), "branch", "team_test"])
             self.assertEqual(core_branches_for(repo), {"main": "team_master", "test": "team_test"})
+
+    def test_project_branch_overrides_drive_scan_and_can_be_cleared(self):
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            repo = root / "repo"
+            bare = root / "origin.git"
+            repo.mkdir()
+            self.assertEqual(run(["git", "init", "-q", "-b", "develop", str(repo)]).code, 0)
+            run(["git", "-C", str(repo), "config", "user.email", "test@example.com"])
+            run(["git", "-C", str(repo), "config", "user.name", "Test"])
+            (repo / "a.txt").write_text("a")
+            run(["git", "-C", str(repo), "add", "a.txt"])
+            run(["git", "-C", str(repo), "commit", "-qm", "init"])
+            run(["git", "-C", str(repo), "branch", "qa-release"])
+            harbor = Harbor({"roots": [str(root)], "max_depth": 4, "stale_days": 30})
+            managed = next(item for item in harbor.scan()["repositories"] if item["name"] == "repo")
+            with mock.patch("worktree_harbor.write_config") as write_config:
+                result = harbor.set_repo_branches(managed["id"], "develop", "qa-release")
+            self.assertEqual(write_config.call_count, 1)
+            repository = next(item for item in result["state"]["repositories"] if item["name"] == "repo")
+            self.assertEqual(repository["core_branches"], {"main": "develop", "test": "qa-release"})
+            self.assertEqual(repository["branch_overrides"], {"main": "develop", "test": "qa-release"})
+            self.assertEqual(repository["worktrees"][0]["branch_role"], "main")
+            with mock.patch("worktree_harbor.write_config"):
+                cleared = harbor.set_repo_branches(managed["id"], "", "")
+            repository = next(item for item in cleared["state"]["repositories"] if item["name"] == "repo")
+            self.assertEqual(repository["branch_overrides"], {})
 
     def test_marks_committed_head_merged_into_test_but_not_main(self):
         with tempfile.TemporaryDirectory() as temp:
@@ -255,6 +310,146 @@ class CoreTests(unittest.TestCase):
             state = harbor.scan()
             managed = next(item for item in state["repositories"] if Path(item["path"]).resolve() == repo.resolve())
             self.assertEqual(harbor.repo_paths[managed["id"]], repo.resolve())
+
+    def test_merge_to_test_uses_custom_project_test_branch(self):
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            repo = root / "repo"
+            bare = root / "origin.git"
+            source = root / "feature-worktree"
+            target = root / "qa-worktree"
+            repo.mkdir()
+            run(["git", "init", "--bare", str(bare)])
+            run(["git", "init", "-q", "-b", "develop", str(repo)])
+            run(["git", "-C", str(repo), "config", "user.email", "test@example.com"])
+            run(["git", "-C", str(repo), "config", "user.name", "Test"])
+            (repo / "a.txt").write_text("base")
+            run(["git", "-C", str(repo), "add", "a.txt"])
+            run(["git", "-C", str(repo), "commit", "-qm", "base"])
+            run(["git", "-C", str(repo), "remote", "add", "origin", str(bare)])
+            run(["git", "-C", str(repo), "push", "-q", "-u", "origin", "develop"])
+            run(["git", "-C", str(repo), "branch", "qa-release"])
+            run(["git", "-C", str(repo), "push", "-q", "origin", "qa-release"])
+            run(["git", "-C", str(repo), "worktree", "add", "-q", "-b", "feature/demo", str(source)])
+            run(["git", "-C", str(repo), "worktree", "add", "-q", str(target), "qa-release"])
+            (source / "a.txt").write_text("feature")
+            run(["git", "-C", str(source), "add", "a.txt"])
+            run(["git", "-C", str(source), "commit", "-qm", "feature"])
+            harbor = Harbor({"roots": [str(root)], "max_depth": 4, "stale_days": 30})
+            managed = next(item for item in harbor.scan()["repositories"] if item["name"] == "repo")
+            with mock.patch("worktree_harbor.write_config"):
+                harbor.set_repo_branches(managed["id"], "develop", "qa-release")
+            result = harbor.merge_to_test(managed["id"], str(source))
+            self.assertIn("已将 feature/demo 合并到 qa-release", result["message"])
+            self.assertEqual(run(["git", "-C", str(target), "show", "-s", "--format=%s"]).stdout, "feature")
+
+    def test_merge_to_test_uses_existing_linked_worktree_and_blocks_dirty_target(self):
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            repo = root / "repo"
+            bare = root / "origin.git"
+            source = root / "feature-worktree"
+            target = root / "test-worktree"
+            repo.mkdir()
+            run(["git", "init", "--bare", str(bare)])
+            run(["git", "init", "-q", "-b", "main", str(repo)])
+            run(["git", "-C", str(repo), "config", "user.email", "test@example.com"])
+            run(["git", "-C", str(repo), "config", "user.name", "Test"])
+            (repo / "a.txt").write_text("base")
+            run(["git", "-C", str(repo), "add", "a.txt"])
+            run(["git", "-C", str(repo), "commit", "-qm", "base"])
+            run(["git", "-C", str(repo), "remote", "add", "origin", str(bare)])
+            run(["git", "-C", str(repo), "push", "-q", "-u", "origin", "main"])
+            run(["git", "-C", str(repo), "branch", "team_test"])
+            run(["git", "-C", str(repo), "push", "-q", "origin", "team_test"])
+            run(["git", "-C", str(repo), "worktree", "add", "-q", "-b", "feature/demo", str(source)])
+            run(["git", "-C", str(repo), "worktree", "add", "-q", str(target), "team_test"])
+            (source / "a.txt").write_text("feature")
+            run(["git", "-C", str(source), "add", "a.txt"])
+            run(["git", "-C", str(source), "commit", "-qm", "feature"])
+
+            harbor = Harbor({"roots": [str(root)], "max_depth": 4, "stale_days": 30})
+            managed = next(item for item in harbor.scan()["repositories"] if item["name"] == "repo")
+            result = harbor.merge_to_test(managed["id"], str(source))
+            self.assertIn("已将 feature/demo 合并到 team_test", result["message"])
+            self.assertEqual(run(["git", "-C", str(target), "show", "-s", "--format=%s"]).stdout, "feature")
+
+            (target / "local.txt").write_text("未提交")
+            with self.assertRaisesRegex(HarborError, "测试分支有未提交修改"):
+                harbor.merge_to_test(managed["id"], str(source))
+
+    def test_merge_to_test_can_commit_push_source_then_merge(self):
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            bare = root / "origin.git"
+            repo = root / "repo"
+            source = root / "feature-worktree"
+            target = root / "test-worktree"
+            run(["git", "init", "--bare", str(bare)])
+            run(["git", "init", "-q", "-b", "main", str(repo)])
+            run(["git", "-C", str(repo), "config", "user.email", "test@example.com"])
+            run(["git", "-C", str(repo), "config", "user.name", "Test"])
+            (repo / "a.txt").write_text("base")
+            run(["git", "-C", str(repo), "add", "a.txt"])
+            run(["git", "-C", str(repo), "commit", "-qm", "base"])
+            run(["git", "-C", str(repo), "remote", "add", "origin", str(bare)])
+            run(["git", "-C", str(repo), "push", "-q", "-u", "origin", "main"])
+            run(["git", "-C", str(repo), "branch", "team_test"])
+            run(["git", "-C", str(repo), "push", "-q", "origin", "team_test"])
+            run(["git", "-C", str(repo), "worktree", "add", "-q", "-b", "feature/demo", str(source)])
+            run(["git", "-C", str(repo), "worktree", "add", "-q", str(target), "team_test"])
+            (source / "a.txt").write_text("feature")
+            (source / "new.txt").write_text("new")
+            harbor = Harbor({"roots": [str(root)], "max_depth": 4, "stale_days": 30})
+            managed = next(item for item in harbor.scan()["repositories"] if item["name"] == "repo")
+            plan = harbor.prepare_merge_to_test(managed["id"], str(source))
+            self.assertTrue(plan["source_dirty"])
+            self.assertEqual(plan["remote"], "origin")
+            self.assertEqual(plan["push_branch"], "feature/demo")
+            result = harbor.merge_to_test(
+                managed["id"], str(source), commit_dirty=True, push_source=True,
+                commit_message="feat: sync demo", expected_fingerprint=plan["fingerprint"],
+            )
+            self.assertIn("已将 feature/demo 合并到 team_test", result["message"])
+            self.assertEqual(run(["git", "-C", str(target), "show", "-s", "--format=%s"]).stdout, "feat: sync demo")
+            self.assertEqual(run(["git", "--git-dir", str(bare), "show", "refs/heads/feature/demo:a.txt"]).stdout, "feature")
+
+    def test_merge_to_test_updates_existing_remote_branch_for_nested_source(self):
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            bare = root / "origin.git"
+            repo = root / "repo"
+            source = root / "feature-worktree"
+            target = root / "test-worktree"
+            run(["git", "init", "--bare", str(bare)])
+            run(["git", "init", "-q", "-b", "main", str(repo)])
+            run(["git", "-C", str(repo), "config", "user.email", "test@example.com"])
+            run(["git", "-C", str(repo), "config", "user.name", "Test"])
+            (repo / "a.txt").write_text("base")
+            run(["git", "-C", str(repo), "add", "a.txt"])
+            run(["git", "-C", str(repo), "commit", "-qm", "base"])
+            run(["git", "-C", str(repo), "remote", "add", "origin", str(bare)])
+            run(["git", "-C", str(repo), "push", "-q", "-u", "origin", "main"])
+            run(["git", "-C", str(repo), "branch", "team_test"])
+            run(["git", "-C", str(repo), "push", "-q", "origin", "team_test"])
+            run(["git", "-C", str(repo), "worktree", "add", "-q", "-b", "feature/demo", str(source)])
+            run(["git", "-C", str(source), "push", "-q", "-u", "origin", "feature/demo"])
+            run(["git", "-C", str(repo), "worktree", "add", "-q", str(target), "team_test"])
+            (source / "a.txt").write_text("feature")
+            (source / "new.txt").write_text("new")
+            harbor = Harbor({"roots": [str(root)], "max_depth": 4, "stale_days": 30})
+            managed = next(item for item in harbor.scan()["repositories"] if item["name"] == "repo")
+            plan = harbor.prepare_merge_to_test(managed["id"], str(source))
+            self.assertTrue(plan["source_dirty"])
+            self.assertEqual(plan["remote"], "origin")
+            self.assertEqual(plan["push_branch"], "feature/demo")
+            result = harbor.merge_to_test(
+                managed["id"], str(source), commit_dirty=True, push_source=True,
+                commit_message="feat: sync demo", expected_fingerprint=plan["fingerprint"],
+            )
+            self.assertIn("已将 feature/demo 合并到 team_test", result["message"])
+            self.assertEqual(run(["git", "-C", str(target), "show", "-s", "--format=%s"]).stdout, "feat: sync demo")
+            self.assertEqual(run(["git", "--git-dir", str(bare), "show", "refs/heads/feature/demo:a.txt"]).stdout, "feature")
 
     def test_discovers_repository_inside_aggregate_repository(self):
         with tempfile.TemporaryDirectory() as temp:
@@ -311,6 +506,16 @@ class CoreTests(unittest.TestCase):
 
             (root / "package.json").write_text('{"scripts":{"dev":"vite"}}')
             self.assertEqual(preview_kind_for(root), "web")
+
+    def test_preview_environment_includes_discovered_node_bin(self):
+        harbor = Harbor({"roots": []})
+        with mock.patch.object(
+            Harbor,
+            "command_path",
+            side_effect=lambda name: f"/opt/tools/{name}/bin/{name}",
+        ):
+            environment = harbor.command_environment("pnpm", "node")
+        self.assertTrue(environment["PATH"].startswith("/opt/tools/pnpm/bin:/opt/tools/node/bin"))
 
     def test_web_preview_replaces_previous_worktree_and_reuses_url(self):
         class FakeProcess:

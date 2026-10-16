@@ -23,7 +23,7 @@
     <main>
       <header>
         <div><p class="eyebrow">工作树清理</p><h1>清理工作区</h1><p class="subtitle" id="scan-summary">正在扫描项目…</p></div>
-        <div class="header-actions"><button class="secondary import-directory" id="import-directory">＋ 导入目录</button><label class="search"><span>⌕</span><input id="search" placeholder="搜索项目或分支 · ⌘K"></label><button class="secondary select-current" id="select-visible">全选当前</button><button class="secondary icon-refresh" id="refresh" title="刷新 · ⌘R">↻</button><button class="primary cleanup-primary" id="cleanup-button"><span id="cleanup-button-label">建议</span> <b id="cleanup-button-count">0</b></button></div>
+        <div class="header-actions"><label class="search"><span>⌕</span><input id="search" placeholder="搜索项目、分支、路径或提交 · ⌘K"></label><button class="secondary select-current" id="select-visible">全选当前</button><button class="secondary icon-refresh" id="refresh" title="刷新 · ⌘R">↻</button></div>
       </header>
       <section class="selection-bar" id="selection-bar">
         <div class="selection-summary"><span class="selection-check">✓</span><strong id="selection-count">0</strong><span id="selection-detail">个工作树已选择</span></div>
@@ -36,7 +36,7 @@
         <article class="stat skeleton"><span>正在整理顺序</span><strong>…</strong><small>约需数秒</small></article>
       </section>
       <section class="notice hidden" id="empty-notice"></section>
-      <section id="repositories" class="repositories"><div class="scan-placeholder"><span class="scan-spinner"></span><div><strong>正在扫描本地工作树</strong><p>仓库较多时约需 10–15 秒，只读取版本库状态，不会联网获取、合并或修改文件。</p></div></div></section>
+      <section id="repositories" class="repositories"><div class="scan-placeholder"><span class="scan-spinner"></span><div><strong>正在扫描本地工作树</strong><p>仓库较多时约需 10–15 秒。扫描只读取版本库状态；提交、推送和合并只会在你确认操作后执行。</p></div></div></section>
     </main>
   </div>
 
@@ -44,10 +44,12 @@
 
   <dialog id="settings-dialog">
     <form method="dialog" class="dialog-card" id="settings-form">
-      <div class="dialog-head"><div><p class="eyebrow">设置</p><h2>扫描范围</h2></div><button class="icon-button" value="cancel" aria-label="关闭">×</button></div>
-      <label>项目根目录 <small>每行一个，工具会查找其中的版本库</small><textarea id="roots" rows="6" spellcheck="false"></textarea></label>
+      <div class="dialog-head"><div><p class="eyebrow">设置</p><h2>扫描范围</h2></div><button class="icon-button" id="close-settings" type="button" aria-label="关闭">×</button></div>
+      <label class="roots-label">项目根目录 <small>每个项目一行；可以直接输入路径，也可以用“选择”按钮添加</small></label>
+      <div id="root-list" class="root-list" aria-live="polite"></div>
+      <div class="root-list-footer"><button class="secondary mini" id="add-root" type="button">＋ 添加项目目录</button><span>多个项目可以分别维护，保存时一起扫描</span></div>
       <div class="form-grid"><label>扫描深度<input id="max-depth" type="number" min="1" max="12"></label><label>陈旧阈值（天）<input id="stale-days" type="number" min="1" max="3650"></label></div>
-      <div class="dialog-actions"><button class="secondary" value="cancel">取消</button><button class="primary" id="save-settings" value="default">保存并重新扫描</button></div>
+      <div class="dialog-actions"><button class="secondary" id="cancel-settings" type="button">取消</button><button class="primary" id="save-settings" type="submit" value="default">保存并重新扫描</button></div>
     </form>
   </dialog>
 
@@ -81,6 +83,28 @@
     </form>
   </dialog>
 
+  <dialog id="merge-dialog">
+    <form class="dialog-card" id="merge-form">
+      <div class="dialog-head"><div><p class="eyebrow">合并到测试</p><h2>提交、推送并合并</h2></div><button class="icon-button" id="close-merge" type="button" aria-label="关闭">×</button></div>
+      <p class="dialog-copy" id="merge-summary"></p>
+      <section class="merge-files-panel" aria-label="源分支待处理文件">
+        <div class="merge-files-heading"><strong>源分支待处理文件</strong><span id="merge-files-count">路径相对源分支工作树根目录</span></div>
+        <div class="merge-files" id="merge-files"></div>
+      </section>
+      <label class="merge-option"><input id="merge-commit-dirty" type="checkbox"><span>提交以上全部本地改动（含未跟踪文件）</span></label>
+      <label id="merge-message-field">提交说明<input id="merge-commit-message" placeholder="填写本次代码改动说明" maxlength="500"></label>
+      <label class="merge-option"><input id="merge-push-source" type="checkbox" checked disabled><span id="merge-push-detail">提交后推送源分支，再合并到测试</span></label>
+      <section class="merge-progress hidden" id="merge-progress" aria-live="polite">
+        <div class="merge-progress-heading"><strong>执行进度</strong><span id="merge-progress-state">等待执行</span></div>
+        <div class="merge-steps" id="merge-steps"></div>
+        <div class="merge-log-heading"><strong>操作日志</strong></div>
+        <div class="merge-log" id="merge-log"></div>
+      </section>
+      <p class="dialog-copy">远程已有同名分支时推送最新提交，没有时创建同名分支并推送。合并成功后会推送测试分支；如果发生冲突，会保留冲突现场，交由你手动解决。</p>
+      <p class="merge-error hidden" id="merge-error" role="alert"></p>
+      <div class="dialog-actions"><button class="secondary" id="cancel-merge" type="button">取消</button><button class="primary" id="confirm-merge" type="submit">确认执行</button></div>
+    </form>
+  </dialog>
   <script src="/app.js"></script>
 </body>
 </html>

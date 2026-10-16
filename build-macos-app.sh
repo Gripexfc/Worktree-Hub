@@ -10,9 +10,12 @@ if [[ -d "$APP_PATH" ]]; then
 fi
 
 /bin/mkdir -p "$CONTENTS/MacOS" "$CONTENTS/Resources/static"
+SWIFT_MODULECACHE_PATH="${SWIFT_MODULECACHE_PATH:-${TMPDIR:-/tmp}/worktree-harbor-swift-module-cache}"
+/bin/mkdir -p "$SWIFT_MODULECACHE_PATH"
 /usr/bin/xcrun swiftc \
   "$ROOT_DIR/macos/WorktreeHarborApp.swift" \
   -o "$CONTENTS/MacOS/WorktreeHarbor" \
+  -module-cache-path "$SWIFT_MODULECACHE_PATH" \
   -framework AppKit -framework WebKit \
   -O
 

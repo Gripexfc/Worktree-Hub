@@ -6,6 +6,7 @@ let activeFilter = "all";
 let activeWorkspace = "all";
 let pendingRemove = null;
 let onboardingOpened = false;
+let rootEditorValues = [];
 const expandedRepos = new Set();
 const selectedWorktrees = new Map();
 
@@ -99,18 +100,46 @@ function counts(repositories=state.repositories) {
 }
 
 function render() {
-  const c = counts();
-  if(activeFilter==="cleanup"&&c.cleanup===0)activeFilter="all";
-  $("#cleanup-button").disabled=c.cleanup===0;
-  $("#cleanup-button").classList.toggle("active",activeFilter==="cleanup");
-  $("#cleanup-button-label").textContent=activeFilter==="cleanup"?"显示全部":"建议";
-  $("#cleanup-button-count").textContent=c.cleanup;
+  const query = $("#search")?.value || "";
+  const visible = query.trim() ? filteredRepositories(query).map(({repo, worktrees}) => ({...repo, worktrees})) : state.repositories;
+  const c = counts(visible);
   $("#stats").innerHTML = [["仓库",c.repos,"个项目",""],["近期未提交",c.activeDirty,"删除会丢失本地改动","hot"],["全部可管理",c.deletable,"覆盖所有工作树","safe"],["建议清理",c.cleanup,"陈旧或失效","calm"]].map(([k,v,s,t])=>`<article class="stat ${t}"><span>${k}</span><strong>${v}</strong><small>${s}</small></article>`).join("");
   $("#scan-summary").textContent = `扫描 ${state.workspaces?.length || state.roots.length} 个工作区 · ${state.scan_ms || 0} 毫秒`;
-  $("#roots").value=state.roots.join("\n"); $("#max-depth").value=state.settings.max_depth||5; $("#stale-days").value=state.settings.stale_days||30;
+  if (!$("#settings-dialog").open) renderRootEditor(state.roots);
+  $("#max-depth").value=state.settings.max_depth||5; $("#stale-days").value=state.settings.stale_days||30;
   renderWorkspaceNav();
   renderRepos();
   renderSelectionBar();
+}
+
+function renderRootEditor(values = rootEditorValues) {
+  rootEditorValues = values.length ? values.map(value => String(value)) : [""];
+  const list = $("#root-list");
+  if (!list) return;
+  list.innerHTML = rootEditorValues.map((value, index) => `
+    <div class="root-row">
+      <span class="root-index">${String(index + 1).padStart(2, "0")}</span>
+      <input data-root-input="${index}" value="${escapeHtml(value)}" placeholder="/Users/fc/项目目录" spellcheck="false" aria-label="项目目录 ${index + 1}">
+      <button class="secondary mini root-pick" type="button" data-root-pick="${index}">选择</button>
+      <button class="icon-button root-remove" type="button" data-root-remove="${index}" aria-label="移除项目目录 ${index + 1}">×</button>
+    </div>`).join("");
+}
+
+function syncRootEditorValues() {
+  rootEditorValues = $$("[data-root-input]").map(input => input.value);
+  return rootEditorValues;
+}
+
+async function chooseRootDirectory(index) {
+  try {
+    const data = await api("/api/action", {method:"POST", body:JSON.stringify({action:"choose_directory"})});
+    if (!data.path) return;
+    syncRootEditorValues();
+    rootEditorValues[index] = data.path;
+    renderRootEditor(rootEditorValues);
+  } catch (error) {
+    toast(error.message, true);
+  }
 }
 
 function renderWorkspaceNav() {
@@ -155,9 +184,53 @@ function worktreePriority(w) {
   return 6;
 }
 
+function normalizeSearch(value) {
+  return String(value || "").normalize("NFKC").toLocaleLowerCase().trim();
+}
+
+function searchTokens(value) {
+  return normalizeSearch(value)
+    .replace(/[\/\\:;,|()[\]{}<>#?=+、。！？；，]+/g, " ")
+    .split(/\s+/)
+    .filter(Boolean);
+}
+
+let searchRenderTimer = null;
+function scheduleSearchRender() {
+  window.clearTimeout(searchRenderTimer);
+  searchRenderTimer = window.setTimeout(() => render(), 80);
+}
+
 function matchesQuery(repo, w, query) {
-  if (!query) return true;
-  return `${repo.workspace_name} ${repo.name} ${repo.path} ${repo.remote} ${w.branch} ${w.base_branch?.name||""} ${w.path} ${w.commit?.subject}`.toLowerCase().includes(query);
+  const tokens = searchTokens(query);
+  if (!tokens.length) return true;
+  const workspace = (state.workspaces || []).find(item => item.id === repo.workspace_id);
+  const haystack = [
+    workspace?.name,
+    workspace?.root,
+    workspace?.relative_path,
+    repo.workspace_name,
+    repo.name,
+    repo.path,
+    repo.relative_path,
+    repo.remote,
+    w.branch,
+    w.base_branch?.name,
+    w.path,
+    w.commit?.subject,
+  ].map(normalizeSearch).join(" ");
+  const searchable = searchTokens(haystack).join(" ");
+  return tokens.every(token => searchable.includes(token));
+}
+
+function filteredRepositories(query = $("#search").value) {
+  return state.repositories
+    .filter(repo => activeWorkspace === "all" || repo.workspace_id === activeWorkspace)
+    .map(repo => ({
+      repo,
+      worktrees: repo.worktrees.filter(w => matchesFilter(w) && matchesQuery(repo, w, query)),
+    }))
+    .filter(({worktrees}) => worktrees.length);
 }
 
 const selectionKey = (repoId, path) => `${repoId}\u0000${path}`;
@@ -193,7 +266,7 @@ function renderRepos() {
     if (!visibleRepos.length) continue;
     const regular = sortRepos(visibleRepos.filter(repo => repo.kind === "project"));
     const support = sortRepos(visibleRepos.filter(repo => repo.kind !== "project"));
-    const c = counts(workspaceRepos);
+    const c = counts(visibleRepos.map(repo => ({...repo, worktrees: repo.worktrees.filter(w => matchesFilter(w) && matchesQuery(repo, w, query))})));
     const index = (state.workspaces || []).findIndex(w => w.id === workspace.id);
     blocks.push(`<section class="workspace-block">
       <div class="workspace-head">
@@ -210,6 +283,25 @@ function renderRepos() {
   renderSelectionBar();
 }
 
+function branchConfigEditor(repo) {
+  const overrides = repo.branch_overrides || {};
+  const detected = repo.core_branches || {};
+  const branches = repo.branch_options || [];
+  const listId = `branch-options-${repo.id}`;
+  const options = branches.map(branch => `<option value="${escapeHtml(branch)}"></option>`).join("");
+  const mainBranch = overrides.main || detected.main || "";
+  const testBranch = overrides.test || detected.test || "";
+  return `<div class="repo-branch-config">
+    <div class="repo-branch-heading"><strong>项目分支规则</strong><small>清空后恢复自动识别</small></div>
+    <div class="repo-branch-fields">
+      <label>主分支<input data-branch-config-input data-branch-role="main" value="${escapeHtml(mainBranch)}" placeholder="自动识别" list="${listId}" aria-label="${escapeHtml(repo.name)} 主分支"></label>
+      <label>测试分支<input data-branch-config-input data-branch-role="test" value="${escapeHtml(testBranch)}" placeholder="自动识别" list="${listId}" aria-label="${escapeHtml(repo.name)} 测试分支"></label>
+    </div>
+    <datalist id="${listId}">${options}</datalist>
+    <button class="secondary mini" type="button" data-save-branch-config data-repo="${repo.id}">保存分支规则</button>
+  </div>`;
+}
+
 function repoCard(repo, query) {
   const filtered = repo.worktrees.filter(w => matchesFilter(w) && matchesQuery(repo,w,query)).sort((a,b) => activeFilter === "deletable" ? Number(isCleanupCandidate(b))-Number(isCleanupCandidate(a)) || (b.age_days||0)-(a.age_days||0) : activeFilter === "cleanup" ? (b.age_days||0)-(a.age_days||0) : worktreePriority(a)-worktreePriority(b) || (b.status?.dirty_timestamp||b.commit?.timestamp||0)-(a.status?.dirty_timestamp||a.commit?.timestamp||0));
   const autoExpanded = Boolean(query);
@@ -223,6 +315,7 @@ function repoCard(repo, query) {
   const coreLine = checkoutName ? `<span class="core-line" title="仓库主目录当前检出的分支"><span class="current-chip ${checkout?.branch_role === "pre" ? "pre" : ""}"><b>占用</b>${escapeHtml(checkoutName)}</span></span>` : "";
   const editorOptions = (state.editors||[]).map(editor=>`<option value="${escapeHtml(editor.id)}" ${editor.id===repo.editor_id?"selected":""}>${escapeHtml(editor.label)}</option>`).join("");
   const editorChooser = expanded && editorOptions ? `<label class="repo-editor-choice"><span>默认编辑器</span><select data-editor-select data-repo="${repo.id}" aria-label="${escapeHtml(repo.name)} 默认编辑器">${editorOptions}</select></label>` : "";
+  const branchEditor = expanded ? branchConfigEditor(repo) : "";
   return `<article class="repo-card ${expanded ? "expanded" : ""} ${cardState}" data-repo-card="${repo.id}">
     <div class="repo-head">
       <button class="repo-toggle" data-toggle-repo="${repo.id}" aria-expanded="${expanded}">
@@ -231,7 +324,7 @@ function repoCard(repo, query) {
         <span class="repo-copy"><span class="repo-name-line"><strong>${escapeHtml(repo.name)}</strong><em class="kind ${repo.kind}">${kindLabel(repo.kind)}</em></span>${coreLine}<small title="${escapeHtml(repo.path)}">${escapeHtml(repo.relative_path || repo.path)}</small><span class="repo-preview">${escapeHtml(preview)}</span></span>
       </button>
       <div class="repo-health">${deleteMode ? `<strong class="safe-count">${filtered.length}</strong><span>全部列出</span>${filtered.some(w=>w.status?.dirty)?`<b class="active-dirty">⚠ ${filtered.filter(w=>w.status?.dirty).length} 个有改动</b>`:`<b class="healthy">✓ 全部已提交</b>`}` : `<strong>${c.worktrees}</strong><span>工作树</span>${c.activeDirty ? `<b class="active-dirty">● ${c.activeDirty} 正在修改</b>` : c.idleDirty ? `<b class="idle-dirty">● ${c.idleDirty} 搁置未提交</b>` : `<b class="healthy">✓ 全部已提交</b>`}`}</div>
-      <div class="repo-actions">${editorChooser}</div>
+      <div class="repo-actions">${editorChooser}${branchEditor}</div>
     </div>
     ${expanded ? renderWorktreeGroups(repo,filtered) : ""}
   </article>`;
@@ -276,8 +369,8 @@ function worktreeRow(repo,w) {
   if(w.branch_role === "pre") identityBadges.push('<span class="badge role-pre">预发布</span>');
   if(w.detached || w.branch === "DETACHED") identityBadges.push('<span class="badge detached">游离提交</span>');
   const mergedPrefix = s.dirty ? "提交已进" : "已进";
-  if(w.merged_into?.test && w.branch_role !== "test") statusBadges.push(`<span class="badge merged-test" title="当前提交已包含在本地 ${escapeHtml(repo.core_branches?.test || "测试分支")} 引用中；不包含未提交修改">✓ ${mergedPrefix}测试</span>`);
-  if(w.merged_into?.main && w.branch_role !== "main") statusBadges.push(`<span class="badge merged-main" title="当前提交已包含在本地 ${escapeHtml(repo.core_branches?.main || "主分支")} 引用中；不包含未提交修改">✓ ${mergedPrefix}主线</span>`);
+  if(!s.dirty && w.merged_into?.test && w.branch_role !== "test") statusBadges.push(`<span class="badge merged-test" title="当前已提交版本已包含在本地 ${escapeHtml(repo.core_branches?.test || "测试分支")} 引用中">✓ 已进测试</span>`);
+  if(!s.dirty && w.merged_into?.main && w.branch_role !== "main") statusBadges.push(`<span class="badge merged-main" title="当前已提交版本已包含在本地 ${escapeHtml(repo.core_branches?.main || "主分支")} 引用中">✓ 已进主线</span>`);
   if(s.dirty) statusBadges.push(`<span class="badge dirty">${s.changed+s.untracked} 项未提交</span>`);
   if(w.locked) statusBadges.push('<span class="badge locked">已锁定</span>');
   if(w.prunable||s.available===false) statusBadges.push('<span class="badge missing">目录缺失</span>');
@@ -298,12 +391,15 @@ function worktreeRow(repo,w) {
     : w.preview_kind === "web"
       ? `<span class="preview-split"><button class="mini effect web test" data-row-action="open_web_test" data-repo="${repo.id}" data-path="${escapeHtml(w.path)}" title="使用测试环境模式启动当前网页">测试</button><button class="mini effect web production" data-row-action="open_web_production" data-repo="${repo.id}" data-path="${escapeHtml(w.path)}" title="使用生产环境模式启动当前网页">生产</button></span>`
       : "";
+  const mergeControl = !w.is_main && w.branch_role !== "test" && w.branch !== "DETACHED" && repo.core_branches?.test
+    ? `<button class="mini merge-test" data-row-action="merge_to_test" data-repo="${repo.id}" data-path="${escapeHtml(w.path)}" title="确认后可提交、推送并合并到 ${escapeHtml(repo.core_branches.test)}">合并到测试</button>`
+    : "";
   const item={repo_id:repo.id,path:w.path,branch:w.branch,dirty:Boolean(s.dirty),changes:(s.changed||0)+(s.untracked||0),locked:Boolean(w.locked),missing:s.available===false};
   const key=selectionKey(repo.id,w.path); if(selectedWorktrees.has(key)) selectedWorktrees.set(key,item);
   const checkbox=canSelect(w)?`<input class="worktree-select" type="checkbox" data-select-worktree data-repo="${repo.id}" data-path="${escapeHtml(w.path)}" data-branch="${escapeHtml(w.branch)}" data-dirty="${s.dirty?"true":"false"}" data-changes="${item.changes}" data-locked="${w.locked?"true":"false"}" data-missing="${item.missing?"true":"false"}" ${selectedWorktrees.has(key)?"checked":""} aria-label="选择 ${escapeHtml(w.branch)}">`:`<span class="select-placeholder"></span>`;
   const occupiedBranch = w.detached || w.branch === "DETACHED" ? "游离提交" : w.branch;
   const openFolderData=`data-row-action="open_folder" data-repo="${repo.id}" data-path="${escapeHtml(w.path)}"`;
-  return `<div class="worktree ${rowState} role-${w.branch_role}"><div class="branch with-select">${checkbox}<div class="branch-copy"><div class="branch-line"><button class="branch-folder-link" ${openFolderData} aria-label="打开 ${escapeHtml(occupiedBranch)} 文件夹">${escapeHtml(occupiedBranch)}</button>${identityBadges.join("")}</div><button class="path-folder-link" ${openFolderData} aria-label="打开 ${escapeHtml(w.path)}">${escapeHtml(w.path)}</button></div></div><div class="base-branch" title="${baseHint}"><strong>${baseText}</strong><small>${baseSourceLabel}</small></div><div class="commit"><div class="status-line"><strong>${activity}</strong>${statusBadges.join("")}</div><p title="${escapeHtml(w.commit?.subject)}">${escapeHtml(w.commit?.subject||s.error||"无提交信息")}</p></div><div class="row-actions">${s.available!==false?`<button class="mini open" data-row-action="open_editor" data-repo="${repo.id}" data-path="${escapeHtml(w.path)}" title="使用 ${escapeHtml(repo.editor_label||"已检测编辑器")} 打开">编辑器</button>${previewControl}`:""}${deleteControl}</div></div>`;
+  return `<div class="worktree ${rowState} role-${w.branch_role}"><div class="branch with-select">${checkbox}<div class="branch-copy"><div class="branch-line"><button class="branch-folder-link" ${openFolderData} aria-label="打开 ${escapeHtml(occupiedBranch)} 文件夹">${escapeHtml(occupiedBranch)}</button>${identityBadges.join("")}</div><button class="path-folder-link" ${openFolderData} aria-label="打开 ${escapeHtml(w.path)}">${escapeHtml(w.path)}</button></div></div><div class="base-branch" title="${baseHint}"><strong>${baseText}</strong><small>${baseSourceLabel}</small></div><div class="commit"><div class="status-line"><strong>${activity}</strong>${statusBadges.join("")}</div><p title="${escapeHtml(w.commit?.subject)}">${escapeHtml(w.commit?.subject||s.error||"无提交信息")}</p></div><div class="row-actions">${s.available!==false?`<button class="mini open" data-row-action="open_editor" data-repo="${repo.id}" data-path="${escapeHtml(w.path)}" title="使用 ${escapeHtml(repo.editor_label||"已检测编辑器")} 打开">编辑器</button>${previewControl}`:""}<span class="row-management">${s.available!==false?mergeControl:""}${deleteControl}</span></div></div>`;
 }
 
 function renderRemoveDialog(items) {
@@ -340,9 +436,9 @@ function removeItemsFromState(items) {
   for (const repo of state.repositories) repo.worktrees=repo.worktrees.filter(w=>!removed.has(selectionKey(repo.id,w.path)));
 }
 
-async function action(payload,{blocking=true}={}) {
+async function action(payload,{blocking=true,silent=false}={}) {
   if (blocking) document.body.classList.add("loading");
-  try { const data=await api("/api/action",{method:"POST",body:JSON.stringify(payload)}); toast(data.message); if(data.state){state=data.state;render();} return data; }
+  try { const data=await api("/api/action",{method:"POST",body:JSON.stringify(payload)}); if(!silent && data.message)toast(data.message); if(data.state){state=data.state;render();} return data; }
   catch(error){toast(error.message,true); throw error;}
   finally{if(blocking)document.body.classList.remove("loading");}
 }
@@ -351,11 +447,152 @@ function setFilter(filter) {
   activeFilter=filter; expandedRepos.clear(); render();
 }
 
+let pendingMerge = null;
+let mergeBusy = false;
+let mergePollTimer = null;
+function mergeFileStatus(code) {
+  const value = String(code || "");
+  if (value === "??") return ["未跟踪", "untracked"];
+  if (value.includes("U")) return ["冲突", "conflict"];
+  if (value.includes("D")) return ["删除", "deleted"];
+  if (value.includes("R")) return ["重命名", "renamed"];
+  if (value.includes("A")) return ["新增", "added"];
+  if (value.includes("M")) return ["修改", "modified"];
+  return [value || "其他", "other"];
+}
+function renderMergeFiles(files = []) {
+  const rows = files.map(raw => {
+    const line = String(raw || "");
+    const code = line.slice(0, 2).trim() || "?";
+    const path = line.length > 3 ? line.slice(3) : line;
+    const [label, tone] = mergeFileStatus(code);
+    return `<div class="merge-file"><span class="merge-file-status ${tone}">${label}</span><code title="${escapeHtml(path)}">${escapeHtml(path)}</code></div>`;
+  }).join("");
+  $("#merge-files").innerHTML = rows || '<div class="merge-files-empty">当前源分支没有未提交文件</div>';
+  $("#merge-files-count").textContent = files.length ? `${files.length} 项 · 路径相对源分支工作树根目录` : "没有待提交文件";
+}
+function openMergeDialog(plan) {
+  pendingMerge=plan;
+  $("#confirm-merge").type="submit";
+  $("#confirm-merge").onclick=null;
+  $("#merge-form").querySelectorAll("button,input").forEach(el=>el.disabled=false);
+  $("#confirm-merge").textContent="确认执行";
+  $("#merge-summary").textContent=plan.source_branch+" → "+plan.target_branch;
+  renderMergeFiles(plan.files || []);
+  $("#merge-commit-dirty").checked=plan.source_dirty;
+  $("#merge-commit-dirty").disabled=!plan.source_dirty;
+  $("#merge-message-field").classList.toggle("hidden",!plan.source_dirty);
+  $("#merge-commit-message").value="";
+  $("#merge-push-source").checked=true;
+  $("#merge-push-source").disabled=true;
+  $("#merge-push-detail").textContent=plan.remote
+    ? `推送源分支到 ${plan.remote}/${plan.push_branch}（已有远程分支则更新，没有则创建）后再合并`
+    : "没有可用远程仓库，无法继续合并";
+  $("#merge-error").classList.add("hidden");
+  $("#merge-progress").classList.add("hidden");
+  $("#merge-progress-state").textContent="等待执行";
+  $("#merge-steps").innerHTML="";
+  $("#merge-log").innerHTML="";
+  $("#merge-dialog").showModal();
+}
+function renderMergeJob(job) {
+  $("#merge-progress").classList.remove("hidden");
+  $("#merge-progress-state").textContent = job.status === "success" ? "已完成" : job.status === "error" ? "执行失败" : "执行中…";
+  $("#merge-steps").innerHTML = (job.steps || []).map(step => {
+    const icon = step.status === "success" ? "✓" : step.status === "error" ? "!" : step.status === "running" ? "↻" : step.status === "skipped" ? "—" : "○";
+    return `<div class="merge-step ${escapeHtml(step.status)}"><span>${icon}</span><div><strong>${escapeHtml(step.label)}</strong>${step.detail ? `<small>${escapeHtml(step.detail)}</small>` : ""}</div></div>`;
+  }).join("");
+  $("#merge-log").innerHTML = (job.logs || []).map(item => `<div><time>${escapeHtml(item.time)}</time><span>${escapeHtml(item.message)}</span></div>`).join("");
+  const log = $("#merge-log"); log.scrollTop = log.scrollHeight;
+  if(job.status === "error") {
+    $("#merge-error").textContent = job.error || "合并失败";
+    $("#merge-error").classList.remove("hidden");
+  }
+}
+async function pollMergeJob(jobId) {
+  try {
+    const data = await action({action:"merge_to_test_status", job_id:jobId},{blocking:false,silent:true});
+    renderMergeJob(data.job);
+    if(data.job.status === "running" || data.job.status === "queued") {
+      mergePollTimer = window.setTimeout(() => pollMergeJob(jobId), 350);
+      return;
+    }
+    mergeBusy = false;
+    $("#close-merge").disabled = false;
+    $("#cancel-merge").disabled = false;
+    if(data.job.status === "success") {
+      $("#merge-dialog").close(); pendingMerge=null;
+      if(data.job.result?.state){ state=data.job.result.state; render(); }
+      toast(data.job.result?.message || "合并完成");
+    } else {
+      $("#confirm-merge").textContent = "关闭";
+      $("#confirm-merge").disabled = false;
+      $("#confirm-merge").type = "button";
+      $("#confirm-merge").onclick = closeMergeDialog;
+    }
+  } catch(error) {
+    mergeBusy=false; $("#merge-error").textContent=error.message; $("#merge-error").classList.remove("hidden");
+  }
+}
+function closeMergeDialog(){if(!mergeBusy){$("#merge-dialog").close();pendingMerge=null;}}
+$("#close-merge").addEventListener("click",closeMergeDialog);
+$("#cancel-merge").addEventListener("click",closeMergeDialog);
+$("#merge-dialog").addEventListener("cancel",e=>{if(mergeBusy)e.preventDefault();else closeMergeDialog();});
+$("#merge-form").addEventListener("submit",async e=>{
+  e.preventDefault(); if(!pendingMerge||mergeBusy)return;
+  const plan=pendingMerge;
+  const commitDirty=$("#merge-commit-dirty").checked;
+  const message=$("#merge-commit-message").value.trim();
+  if(plan.source_dirty&&(!commitDirty||!message)){
+    $("#merge-error").textContent="请勾选提交本地改动并填写提交说明，或取消后自行处理改动。";
+    $("#merge-error").classList.remove("hidden");return;
+  }
+  mergeBusy=true;
+  $("#merge-progress").classList.remove("hidden");
+  $("#merge-form").querySelectorAll("button,input").forEach(el=>el.disabled=true);
+  $("#confirm-merge").textContent="执行中…";
+  try {
+    const data=await action({action:"merge_to_test",repo_id:plan.repo_id,path:plan.source_path,commit_dirty:commitDirty,push_source:$("#merge-push-source").checked,commit_message:message,expected_fingerprint:plan.fingerprint},{blocking:false,silent:true});
+    renderMergeJob({status:"queued",steps:[],logs:[{time:new Date().toLocaleTimeString("zh-CN",{hour12:false}),message:"合并任务已开始"}]});
+    pollMergeJob(data.job_id);
+  } catch(error) {
+    $("#merge-error").textContent=error.message;
+    $("#merge-error").classList.remove("hidden");
+    // Retry starts from a fresh, read-only plan after partial progress.
+    $("#confirm-merge").textContent="关闭后重新检查";
+    $("#confirm-merge").disabled=true;
+  } finally {
+    mergeBusy=false;
+    $("#close-merge").disabled=false;$("#cancel-merge").disabled=false;
+    if(!pendingMerge){$("#merge-form").querySelectorAll("button,input").forEach(el=>el.disabled=false);$("#confirm-merge").textContent="确认执行";}
+  }
+});
+
 document.addEventListener("click", async event => {
+  const saveBranches=event.target.closest("[data-save-branch-config]");
+  if(saveBranches){
+    const card=saveBranches.closest("[data-repo-card]");
+    const input=role=>card?.querySelector(`[data-branch-config-input][data-branch-role="${role}"]`);
+    try {
+      await action({action:"set_repo_branches",repo_id:saveBranches.dataset.repo,main_branch:input("main")?.value.trim()||"",test_branch:input("test")?.value.trim()||""});
+    } catch (_) {}
+    return;
+  }
+  const rootPick=event.target.closest("[data-root-pick]");
+  if(rootPick){await chooseRootDirectory(Number(rootPick.dataset.rootPick));return;}
+  const rootRemove=event.target.closest("[data-root-remove]");
+  if(rootRemove){syncRootEditorValues();rootEditorValues.splice(Number(rootRemove.dataset.rootRemove),1);renderRootEditor(rootEditorValues);return;}
   const nav=event.target.closest(".nav-item"); if(nav){setFilter(nav.dataset.filter);return;}
   const workspace=event.target.closest("[data-workspace]"); if(workspace){activeFilter="all";activeWorkspace=activeWorkspace===workspace.dataset.workspace?"all":workspace.dataset.workspace;render();return;}
   const toggle=event.target.closest("[data-toggle-repo]"); if(toggle){const id=toggle.dataset.toggleRepo;if(expandedRepos.has(id))expandedRepos.delete(id);else{expandedRepos.clear();expandedRepos.add(id);}renderRepos();return;}
-  const row=event.target.closest("[data-row-action]"); if(row){await action({action:row.dataset.rowAction,repo_id:row.dataset.repo,path:row.dataset.path});return;}
+  const row=event.target.closest("[data-row-action]"); if(row){
+    if(row.dataset.rowAction === "merge_to_test"){
+      try { const data=await action({action:"prepare_merge_to_test",repo_id:row.dataset.repo,path:row.dataset.path},{blocking:false,silent:true}); openMergeDialog(data.plan); } catch (_) {}
+      return;
+    }
+    const data=await action({action:row.dataset.rowAction,repo_id:row.dataset.repo,path:row.dataset.path});
+    return;
+  }
   const remove=event.target.closest("[data-remove]"); if(remove){
     openRemoveDialog([{repo_id:remove.dataset.repo,path:remove.dataset.path,branch:remove.dataset.branch,dirty:remove.dataset.dirty==="true",changes:Number(remove.dataset.changes||0),locked:remove.dataset.locked==="true",missing:false}]);return;
   }
@@ -372,15 +609,21 @@ document.addEventListener("change", async event=>{
   renderSelectionBar();
 });
 
-$("#search").addEventListener("input",renderRepos); $("#refresh").addEventListener("click",refresh);
-$("#import-directory").addEventListener("click",async()=>{try{await action({action:"import_directory"});}catch(_){}});
+$("#search").addEventListener("input",scheduleSearchRender);
+$("#search").addEventListener("paste",scheduleSearchRender);
+$("#refresh").addEventListener("click",refresh);
 $("#environment-check-button").addEventListener("click",openEnvironmentDialog);
 $("#rerun-environment").addEventListener("click",runEnvironmentCheck);
 $("#close-environment").addEventListener("click",()=>$("#environment-dialog").close());
 $("#complete-environment").addEventListener("click",async()=>{try{await api("/api/action",{method:"POST",body:JSON.stringify({action:"complete_onboarding"})});state.settings.onboarding_version=1;$("#environment-dialog").close();toast("环境检测已完成");}catch(error){toast(error.message,true);}});
-$("#settings-button").addEventListener("click",()=>$("#settings-dialog").showModal());
-$("#cleanup-button").addEventListener("click",()=>setFilter(activeFilter==="cleanup"?"all":"cleanup"));
-$("#settings-form").addEventListener("submit",async e=>{e.preventDefault();try{const data=await api("/api/config",{method:"POST",body:JSON.stringify({roots:$("#roots").value.split('\n').map(x=>x.trim()).filter(Boolean),max_depth:Number($("#max-depth").value),stale_days:Number($("#stale-days").value)})});state=data.state;render();$("#settings-dialog").close();toast(data.message);}catch(error){toast(error.message,true);}});
+$("#settings-button").addEventListener("click",()=>{renderRootEditor(state.roots);$("#settings-dialog").showModal();});
+function closeSettingsDialog(){if($("#settings-dialog").open)$("#settings-dialog").close();}
+$("#close-settings").addEventListener("click",closeSettingsDialog);
+$("#cancel-settings").addEventListener("click",closeSettingsDialog);
+$("#settings-dialog").addEventListener("cancel",closeSettingsDialog);
+$("#add-root").addEventListener("click",()=>{syncRootEditorValues();rootEditorValues.push("");renderRootEditor(rootEditorValues);const inputs=$$("[data-root-input]");inputs[inputs.length-1]?.focus();});
+document.addEventListener("input",event=>{if(event.target.matches("[data-root-input]"))syncRootEditorValues();});
+$("#settings-form").addEventListener("submit",async e=>{e.preventDefault();if(e.submitter?.value==="cancel"){closeSettingsDialog();return;}try{syncRootEditorValues();const data=await api("/api/config",{method:"POST",body:JSON.stringify({roots:rootEditorValues.map(x=>x.trim()).filter(Boolean),max_depth:Number($("#max-depth").value),stale_days:Number($("#stale-days").value)})});state=data.state;$("#settings-dialog").close();render();toast(data.message);}catch(error){toast(error.message,true);}});
 $("#select-visible").addEventListener("click",()=>{const visible=visibleSelections();const allSelected=visible.length&&visible.every(({repo,w})=>selectedWorktrees.has(selectionKey(repo.id,w.path)));for(const {repo,w} of visible){const key=selectionKey(repo.id,w.path);if(allSelected)selectedWorktrees.delete(key);else selectedWorktrees.set(key,{repo_id:repo.id,path:w.path,branch:w.branch,dirty:Boolean(w.status?.dirty),changes:(w.status?.changed||0)+(w.status?.untracked||0),locked:Boolean(w.locked),missing:w.status?.available===false});}renderRepos();});
 $("#clear-selection").addEventListener("click",()=>{selectedWorktrees.clear();renderRepos();});
 $("#remove-selected").addEventListener("click",()=>{if(selectedWorktrees.size)openRemoveDialog([...selectedWorktrees.values()]);});
@@ -398,6 +641,6 @@ $("#remove-form").addEventListener("submit",e=>e.preventDefault());
 document.addEventListener("keydown", event => {
   if ((event.metaKey || event.ctrlKey) && event.key.toLowerCase() === "k") { event.preventDefault(); $("#search").focus(); $("#search").select(); }
   if ((event.metaKey || event.ctrlKey) && event.key.toLowerCase() === "r") { event.preventDefault(); refresh(); }
-  if (event.key === "Escape" && document.activeElement === $("#search") && $("#search").value) { $("#search").value=""; renderRepos(); }
+  if (event.key === "Escape" && document.activeElement === $("#search") && $("#search").value) { $("#search").value=""; render(); }
 });
 refresh();

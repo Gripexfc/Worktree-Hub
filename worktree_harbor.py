@@ -73,12 +73,18 @@ class CmdResult:
     stderr: str
 
 
-def run(argv: Sequence[str], cwd: Optional[Path] = None, timeout: int = 15) -> CmdResult:
+def run(
+    argv: Sequence[str],
+    cwd: Optional[Path] = None,
+    timeout: int = 15,
+    env: Optional[Dict[str, str]] = None,
+) -> CmdResult:
     try:
+        command_env = {**os.environ, **(env or {}), "LC_ALL": "C"}
         process = subprocess.run(
-            list(argv), cwd=str(cwd) if cwd else None, text=True,
+            list(argv), cwd=str(cwd) if cwd else None, stdin=subprocess.DEVNULL, text=True,
             stdout=subprocess.PIPE, stderr=subprocess.PIPE, timeout=timeout,
-            env={**os.environ, "LC_ALL": "C"},
+            env=command_env,
         )
         return CmdResult(process.returncode, process.stdout.strip(), process.stderr.strip())
     except subprocess.TimeoutExpired as exc:
@@ -120,6 +126,7 @@ def read_config() -> Dict[str, object]:
         "max_depth": 5,
         "stale_days": 30,
         "onboarding_version": 0,
+        "repo_branches": {},
     }
 
 
@@ -332,6 +339,19 @@ def repo_identity(repo: Path) -> Tuple[str, str]:
     return common_path, repo_id
 
 
+def branch_names_for(repo: Path) -> List[str]:
+    """Return unique local and origin-tracking branch names for project-level selection."""
+    result = git(repo, "for-each-ref", "--format=%(refname:short)", "refs/heads", "refs/remotes/origin")
+    if result.code != 0:
+        return []
+    names = set()
+    for ref in result.stdout.splitlines():
+        if ref == "origin/HEAD":
+            continue
+        names.add(ref.removeprefix("origin/"))
+    return sorted(names, key=str.lower)
+
+
 def base_candidates_for(repo: Path) -> List[str]:
     result = git(repo, "for-each-ref", "--format=%(refname:short)", "refs/heads", "refs/remotes/origin")
     if result.code != 0:
@@ -344,8 +364,8 @@ def base_candidates_for(repo: Path) -> List[str]:
     return candidates
 
 
-def core_branches_for(repo: Path) -> Dict[str, str]:
-    """Resolve canonical production/test branch names without using current checkout state."""
+def core_branches_for(repo: Path, overrides: Optional[Dict[str, str]] = None) -> Dict[str, str]:
+    """Resolve canonical production/test branches, then apply project-level overrides."""
     result = git(repo, "for-each-ref", "--format=%(refname:short)%09%(committerdate:unix)", "refs/heads", "refs/remotes/origin")
     if result.code != 0:
         return {}
@@ -374,7 +394,13 @@ def core_branches_for(repo: Path) -> Dict[str, str]:
                 main = current.stdout
             elif role == "test" and not test:
                 test = current.stdout
-    return {role: name for role, name in (("main", main), ("test", test)) if name}
+    resolved = {role: name for role, name in (("main", main), ("test", test)) if name}
+    configured = overrides if isinstance(overrides, dict) else {}
+    for role in ("main", "test"):
+        value = str(configured.get(role, "")).strip()
+        if value:
+            resolved[role] = value
+    return resolved
 
 
 def containing_refs_for(repo: Path, head: str) -> List[str]:
@@ -384,10 +410,17 @@ def containing_refs_for(repo: Path, head: str) -> List[str]:
     return result.stdout.splitlines() if result.code == 0 else []
 
 
-def infer_base_branch(repo: Path, row: Dict[str, object], candidates: Sequence[str], containing_refs: Sequence[str] = ()) -> Dict[str, str]:
+def infer_base_branch(
+    repo: Path,
+    row: Dict[str, object],
+    candidates: Sequence[str],
+    containing_refs: Sequence[str] = (),
+    core_branches: Optional[Dict[str, str]] = None,
+) -> Dict[str, str]:
     """Best-effort base branch. Git stores creation source only in a local reflog."""
     branch = str(row.get("branch", ""))
-    if row.get("is_main") or classify_branch(branch) in {"main", "test"}:
+    core_branches = core_branches if isinstance(core_branches, dict) else {}
+    if row.get("is_main") or row.get("branch_role") in {"main", "test"} or branch in core_branches.values() or classify_branch(branch) in {"main", "test"}:
         return {"name": "", "source": "core"}
     creation_head = str(row.get("head", ""))
     if branch and branch != "DETACHED":
@@ -406,8 +439,9 @@ def infer_base_branch(repo: Path, row: Dict[str, object], candidates: Sequence[s
     if matches:
         lower = branch.lower()
         wants_test = any(token in lower for token in ("test", "pre", "uat", "staging"))
+        test_branches = {core_branches.get("test", "")} - {""}
         matches.sort(key=lambda ref: (
-            0 if (classify_branch(ref.removeprefix("origin/")) == "test") == wants_test else 1,
+            0 if ((ref.removeprefix("origin/") in test_branches) or classify_branch(ref.removeprefix("origin/")) == "test") == wants_test else 1,
             0 if not ref.startswith("origin/") else 1,
             len(ref),
         ))
@@ -432,7 +466,7 @@ def enrich_worktree(row: Dict[str, object], stale_days: int, repo: Optional[Path
         "age_days": age_days,
         "stale": age_days is not None and age_days >= stale_days,
         "idle_dirty": bool(status.get("dirty")) and status.get("dirty_age_days") is not None and int(status["dirty_age_days"]) >= stale_days,
-        "base_branch": infer_base_branch(repo, row, base_candidates, containing_refs) if repo else {"name": "", "source": "unknown"},
+        "base_branch": infer_base_branch(repo, row, base_candidates, containing_refs, core_branches) if repo else {"name": "", "source": "unknown"},
         "merged_into": merged_into,
         "preview_kind": preview_kind,
         "preview_environments": miniapp_environments_for(path) if preview_kind == "wechat" else {},
@@ -446,9 +480,96 @@ class Harbor:
         self.repo_paths: Dict[str, Path] = {}
         self.web_preview: Optional[Tuple[subprocess.Popen, str, Path, str, Optional[Path]]] = None
         self.wechat_project: Optional[Path] = None
+        self.merge_jobs: Dict[str, Dict[str, object]] = {}
+        self.merge_jobs_lock = threading.Lock()
+
+    def _merge_job_update(self, job_id: str, **values: object) -> None:
+        with self.merge_jobs_lock:
+            job = self.merge_jobs.get(job_id)
+            if job is None:
+                return
+            job.update(values)
+
+    def _merge_job_log(self, job_id: str, message: str, status: str = "running") -> None:
+        now = time.strftime("%H:%M:%S")
+        with self.merge_jobs_lock:
+            job = self.merge_jobs.get(job_id)
+            if job is None:
+                return
+            job.setdefault("logs", []).append({"time": now, "message": message})
+            job["status"] = status
+
+    def merge_job_status(self, job_id: str) -> Dict[str, object]:
+        with self.merge_jobs_lock:
+            job = self.merge_jobs.get(job_id)
+            if job is None:
+                raise HarborError("合并任务不存在或已过期")
+            return json.loads(json.dumps(job, ensure_ascii=False))
+
+    def start_merge_job(self, payload: Dict[str, object]) -> Dict[str, object]:
+        job_id = secrets.token_urlsafe(18)
+        steps = [
+            {"id": "source-check", "label": "检查源分支状态", "status": "pending"},
+            {"id": "source-commit", "label": "提交源分支本地改动", "status": "pending"},
+            {"id": "source-push", "label": "推送源分支", "status": "pending"},
+            {"id": "target-check", "label": "检查测试分支本地状态", "status": "pending"},
+            {"id": "target-fetch", "label": "获取测试分支最新代码", "status": "pending"},
+            {"id": "merge", "label": "合并源分支到测试分支", "status": "pending"},
+            {"id": "target-push", "label": "推送测试分支", "status": "pending"},
+        ]
+        with self.merge_jobs_lock:
+            self.merge_jobs[job_id] = {"job_id": job_id, "status": "queued", "steps": steps, "logs": [], "result": None, "error": None}
+
+        def worker() -> None:
+            def progress(step_id: str, status: str, message: str = "") -> None:
+                with self.merge_jobs_lock:
+                    job = self.merge_jobs.get(job_id)
+                    if not job:
+                        return
+                    for step in job["steps"]:
+                        if step["id"] == step_id:
+                            step["status"] = status
+                            if message:
+                                step["detail"] = message
+                            break
+                    if message:
+                        job["logs"].append({"time": time.strftime("%H:%M:%S"), "message": message})
+                    job["status"] = "running" if status != "error" else "error"
+            try:
+                result = self.merge_to_test(
+                    str(payload.get("repo_id", "")), str(payload.get("path", "")),
+                    commit_dirty=bool(payload.get("commit_dirty")),
+                    push_source=True,
+                    commit_message=str(payload.get("commit_message", "")),
+                    expected_fingerprint=str(payload.get("expected_fingerprint", "")),
+                    progress=progress,
+                )
+                with self.merge_jobs_lock:
+                    self.merge_jobs[job_id].update(status="success", result=result)
+            except HarborError as exc:
+                with self.merge_jobs_lock:
+                    job = self.merge_jobs[job_id]
+                    job.update(status="error", error=str(exc))
+                    job["logs"].append({"time": time.strftime("%H:%M:%S"), "message": str(exc)})
+        threading.Thread(target=worker, name=f"merge-{job_id}", daemon=True).start()
+        return {"job_id": job_id, "message": "合并任务已开始"}
 
     def roots(self) -> List[Path]:
         return [clean_path(str(value)) for value in self.config.get("roots", [])]
+
+    def branch_overrides_for(self, repo_id: str) -> Dict[str, str]:
+        configured = self.config.get("repo_branches", {})
+        raw = configured.get(repo_id, {}) if isinstance(configured, dict) else {}
+        if not isinstance(raw, dict):
+            return {}
+        return {
+            role: str(raw.get(role, "")).strip()
+            for role in ("main", "test")
+            if str(raw.get(role, "")).strip()
+        }
+
+    def core_branches_for_repo(self, repo_id: str, repo: Path) -> Dict[str, str]:
+        return core_branches_for(repo, self.branch_overrides_for(repo_id))
 
     def workspace_for(self, path: Path) -> Dict[str, str]:
         """Describe the configured workspace that owns a repository path."""
@@ -496,17 +617,23 @@ class Harbor:
             listed_main = Path(str(listed_worktrees[0].get("worktree", ""))) if listed_worktrees else repo
             git_root = listed_main if listed_main.is_dir() else repo
             worktrees = []
+            branch_overrides = self.branch_overrides_for(repo_id)
+            branch_options = branch_names_for(git_root)
             base_candidates = base_candidates_for(git_root)
-            core_branches = core_branches_for(git_root)
+            core_branches = self.core_branches_for_repo(repo_id, git_root)
+            for branch in core_branches.values():
+                if branch not in base_candidates:
+                    base_candidates.append(branch)
             for index, item in enumerate(listed_worktrees):
                 raw_path = str(item.get("worktree", ""))
                 path = Path(raw_path)
                 branch_ref = str(item.get("branch", ""))
                 branch = branch_ref.removeprefix("refs/heads/") if branch_ref else "DETACHED"
+                branch_role = next((role for role, configured_branch in core_branches.items() if branch == configured_branch), classify_branch(branch))
                 row = {
                     "path": raw_path,
                     "branch": branch,
-                    "branch_role": classify_branch(branch),
+                    "branch_role": branch_role,
                     "head": item.get("HEAD", ""),
                     "detached": bool(item.get("detached")),
                     "bare": bool(item.get("bare")),
@@ -535,6 +662,8 @@ class Harbor:
                 "workspace_root": workspace["root"],
                 "kind": workspace["kind"],
                 "relative_path": workspace["relative_path"],
+                "branch_options": branch_options,
+                "branch_overrides": branch_overrides,
                 "core_branches": core_branches,
                 "worktrees": worktrees,
             })
@@ -684,6 +813,32 @@ class Harbor:
         write_config(self.config)
         return {"message": f"该仓库将使用 {editor['label']}", "state": self.scan()}
 
+    def set_repo_branches(self, repo_id: str, main_branch: str = "", test_branch: str = "") -> Dict[str, object]:
+        repo = self.repo(repo_id)
+        values = {"main": str(main_branch).strip(), "test": str(test_branch).strip()}
+        if values["main"] and values["main"] == values["test"]:
+            raise HarborError("主分支和测试分支不能设置为同一个分支")
+        options = set(branch_names_for(repo))
+        labels = {"main": "主分支", "test": "测试分支"}
+        for role, value in values.items():
+            if not value:
+                continue
+            if not BRANCH_RE.fullmatch(value):
+                raise HarborError(f"{labels[role]}名称不符合 Git 分支规则：{value}")
+            if value not in options:
+                raise HarborError(f"未找到{labels[role]}：{value}，请先刷新项目分支")
+        overrides = {role: value for role, value in values.items() if value}
+        configured = self.config.get("repo_branches", {})
+        repo_branches = dict(configured) if isinstance(configured, dict) else {}
+        if overrides:
+            repo_branches[repo_id] = overrides
+        else:
+            repo_branches.pop(repo_id, None)
+        self.config = {**self.config, "repo_branches": repo_branches}
+        write_config(self.config)
+        detail = "、".join(f"{labels[role]} {value}" for role, value in overrides.items()) if overrides else "恢复自动识别"
+        return {"message": f"已保存该项目的分支规则：{detail}", "state": self.scan()}
+
     @staticmethod
     def command_status(name: str) -> Tuple[bool, str]:
         try:
@@ -796,6 +951,206 @@ class Harbor:
         return target
 
     @staticmethod
+    def worktree_for_branch(repo: Path, branch: str) -> Tuple[Path, Dict[str, object]]:
+        """Resolve the existing checkout for a local branch, including linked worktrees."""
+        listing = parse_worktree_porcelain(git(repo, "worktree", "list", "--porcelain", check=True).stdout)
+        for row in listing:
+            ref = str(row.get("branch", ""))
+            name = ref.removeprefix("refs/heads/")
+            if name == branch:
+                target = clean_path(str(row.get("worktree", "")))
+                return target, row
+        raise HarborError(f"没有找到测试分支 {branch} 当前所在的工作树")
+
+    def merge_context(self, repo_id: str, source_raw_path: str) -> Dict[str, object]:
+        repo = self.repo(repo_id)
+        source = self.registered_worktree(repo, source_raw_path)
+        source_listing = parse_worktree_porcelain(git(repo, "worktree", "list", "--porcelain", check=True).stdout)
+        source_row = next((row for row in source_listing if clean_path(str(row.get("worktree", ""))) == source), {})
+        source_branch = str(source_row.get("branch", "")).removeprefix("refs/heads/")
+        if not source_branch or source_branch == "DETACHED":
+            raise HarborError("当前工作树没有可合并的本地分支")
+
+        core_branches = self.core_branches_for_repo(repo_id, repo)
+        test_branch = core_branches.get("test", "")
+        if not test_branch:
+            raise HarborError("没有识别到该仓库的测试分支，请先在项目分支规则中设置")
+        target, target_row = self.worktree_for_branch(repo, test_branch)
+        if source == target:
+            raise HarborError("当前已经位于测试分支，不能把测试分支合并到自己")
+        if not source.is_dir() or not target.is_dir():
+            raise HarborError("来源或测试工作树目录不存在，请先刷新扫描结果")
+        if source_row.get("locked"):
+            raise HarborError("来源工作树已锁定，不能执行合并")
+        if target_row.get("locked"):
+            raise HarborError("测试工作树已锁定，不能执行合并")
+
+        source_status = status_for(source)
+        target_status = status_for(target)
+        if not source_status.get("available") or not target_status.get("available"):
+            raise HarborError("无法读取来源或测试工作树状态")
+        if classify_branch(source_branch) in {"main", "test", "pre"} or source_branch in core_branches.values():
+            raise HarborError("主分支、测试分支和预发布分支不能作为合并来源")
+        return {
+            "repo": repo, "source": source, "target": target, "source_branch": source_branch,
+            "test_branch": test_branch, "source_status": source_status, "target_status": target_status,
+        }
+
+    def prepare_merge_to_test(self, repo_id: str, source_raw_path: str) -> Dict[str, object]:
+        context = self.merge_context(repo_id, source_raw_path)
+        source = context["source"]
+        source_branch = context["source_branch"]
+        upstream = git(source, "rev-parse", "--abbrev-ref", "--symbolic-full-name", "@{u}")
+        upstream_ref = upstream.stdout.strip()
+        remote = upstream_ref.split("/", 1)[0] if upstream.code == 0 and "/" in upstream_ref else ""
+        if not remote and git(source, "remote", "get-url", "origin").code == 0:
+            remote = "origin"
+        files = git(source, "status", "--porcelain", timeout=30).stdout.splitlines()
+        return {
+            "repo_id": repo_id, "source_path": str(source), "source_branch": source_branch,
+            "target_branch": context["test_branch"], "source_dirty": bool(context["source_status"].get("dirty")),
+            "files": files, "remote": remote, "push_branch": source_branch,
+            "fingerprint": hashlib.sha256((source_branch + "\n" + "\n".join(files)).encode()).hexdigest(),
+        }
+
+    def merge_to_test(
+        self,
+        repo_id: str,
+        source_raw_path: str,
+        commit_dirty: bool = False,
+        push_source: bool = False,
+        commit_message: str = "",
+        expected_fingerprint: str = "",
+        progress=None,
+    ) -> Dict[str, object]:
+        """Optionally commit/push a feature worktree, then merge it into test."""
+        def step(step_id: str, status: str, message: str = "") -> None:
+            if progress:
+                progress(step_id, status, message)
+
+        step("source-check", "running", "正在检查源分支状态")
+        context = self.merge_context(repo_id, source_raw_path)
+        repo = context["repo"]
+        source = context["source"]
+        target = context["target"]
+        source_branch = context["source_branch"]
+        test_branch = context["test_branch"]
+        source_status = context["source_status"]
+        target_status = context["target_status"]
+        if expected_fingerprint:
+            current = self.prepare_merge_to_test(repo_id, source_raw_path)["fingerprint"]
+            if current != expected_fingerprint:
+                raise HarborError("源分支状态已经变化，请重新检查后再合并")
+        step("source-check", "success", f"源分支 {source_branch} 状态检查完成")
+        if source_status.get("dirty"):
+            step("source-commit", "running", "正在提交源分支本地改动")
+            if not commit_dirty:
+                step("source-commit", "error", "源分支有未提交改动")
+                raise HarborError("当前功能分支有未提交修改，请先提交后再合并")
+            message = commit_message.strip()
+            if not message:
+                step("source-commit", "error", "未填写提交说明")
+                raise HarborError("提交说明不能为空")
+            git(source, "add", "-A", check=True, timeout=60)
+            git(source, "commit", "-m", message, check=True, timeout=120)
+            source_status = status_for(source)
+            step("source-commit", "success", f"已创建提交：{message}")
+        else:
+            step("source-commit", "skipped", "源分支没有本地改动，跳过提交")
+        if push_source:
+            step("source-push", "running", f"正在推送源分支 {source_branch}")
+            upstream = git(source, "rev-parse", "--abbrev-ref", "--symbolic-full-name", "@{u}")
+            upstream_ref = upstream.stdout.strip()
+            remote = upstream_ref.split("/", 1)[0] if upstream.code == 0 and "/" in upstream_ref else ""
+            if not remote:
+                origin = git(source, "remote", "get-url", "origin")
+                if origin.code != 0:
+                    raise HarborError("源分支没有可用远端，无法推送")
+                remote = "origin"
+            remote_branch = git(
+                source,
+                "ls-remote",
+                "--exit-code",
+                "--heads",
+                remote,
+                f"refs/heads/{source_branch}",
+                timeout=60,
+            )
+            if remote_branch.code == 0:
+                # 远端已有同名分支，推送当前分支的最新提交。
+                push_args = ["push", remote, source_branch]
+            else:
+                # 远端还没有同名分支，创建分支并建立跟踪关系。
+                push_args = ["push", "--set-upstream", remote, source_branch]
+            push_result = git(source, *push_args, timeout=180)
+            if push_result.code != 0:
+                step("source-push", "error", "源分支推送失败")
+                raise HarborError("源分支推送失败，已停止合并；请检查远端权限和认证状态")
+            step("source-push", "success", f"已推送源分支 {remote}/{source_branch}")
+        else:
+            step("source-push", "skipped", "未勾选推送源分支")
+        if source_status.get("dirty"):
+            raise HarborError("提交后源分支仍有未提交修改，已停止合并")
+        step("target-check", "running", "正在检查测试分支本地状态")
+        if target_status.get("dirty"):
+            step("target-check", "error", "测试分支存在未提交代码")
+            raise HarborError("测试分支有未提交修改，已停止合并")
+        if int(target_status.get("ahead", 0)) > 0:
+            step("target-check", "error", "测试分支存在未推送提交")
+            raise HarborError("测试分支存在未推送的本地提交，已停止合并")
+        step("target-check", "success", f"测试分支 {test_branch} 工作区干净")
+        step("target-fetch", "running", f"正在获取 {test_branch} 最新代码")
+        fetch = git(target, "fetch", "origin", timeout=120)
+        if fetch.code != 0:
+            step("target-fetch", "error", "获取测试分支最新代码失败")
+            raise HarborError(fetch.stderr or fetch.stdout or "获取测试分支最新代码失败")
+        remote_ref = f"origin/{test_branch}"
+        if git(target, "show-ref", "--verify", "--quiet", f"refs/remotes/{remote_ref}").code == 0:
+            divergence = git(target, "rev-list", "--left-right", "--count", f"{remote_ref}...{test_branch}")
+            if divergence.code == 0:
+                ahead_text = divergence.stdout.split()
+                if ahead_text and int(ahead_text[1]) > 0:
+                    step("target-fetch", "error", "测试分支无法快进同步")
+                    raise HarborError("测试分支存在未推送的本地提交，已停止合并")
+                if ahead_text and int(ahead_text[0]) > 0:
+                    fast_forward = git(target, "merge", "--ff-only", remote_ref, timeout=120)
+                    if fast_forward.code != 0:
+                        step("target-fetch", "error", "测试分支无法快进同步")
+                        raise HarborError(fast_forward.stderr or fast_forward.stdout or "测试分支无法快进同步")
+                    step("target-fetch", "success", f"已快进同步到 {remote_ref}")
+                if ahead_text and int(ahead_text[0]) == 0 and int(ahead_text[1]) == 0:
+                    step("target-fetch", "success", "测试分支已是最新版本")
+        else:
+            step("target-fetch", "success", "已获取远程最新引用")
+        pending_merge = git(target, "rev-parse", "-q", "--verify", "MERGE_HEAD")
+        if pending_merge.code == 0:
+            step("merge", "error", "测试分支存在未完成的合并")
+            raise HarborError("测试分支存在未完成的合并，请先处理后再试")
+
+        step("merge", "running", f"正在将 {source_branch} 合并到 {test_branch}")
+        result = git(target, "merge", "--no-edit", source_branch, timeout=120)
+        if result.code != 0:
+            detail = (result.stderr or result.stdout or "合并失败")[-1000:]
+            step("merge", "error", "合并发生冲突，已保留现场")
+            raise HarborError(f"无法合并到测试分支，已保留冲突现场，请手动解决：{detail}")
+        step("merge", "success", "合并成功")
+
+        step("target-push", "running", f"正在推送测试分支 {test_branch}")
+        push_target = git(target, "push", "origin", test_branch, timeout=180)
+        if push_target.code != 0:
+            step("target-push", "error", "测试分支推送失败")
+            raise HarborError(push_target.stderr or push_target.stdout or "测试分支推送失败")
+        step("target-push", "success", f"已推送 origin/{test_branch}")
+
+        state = self.scan()
+        return {
+            "message": f"已将 {source_branch} 合并到 {test_branch}",
+            "state": state,
+            "target_path": str(target),
+            "target_branch": test_branch,
+        }
+
+    @staticmethod
     def command_path(name: str) -> str:
         located = shutil.which(name)
         if located:
@@ -812,6 +1167,20 @@ class Harbor:
             if candidate.is_file() and os.access(candidate, os.X_OK):
                 return str(candidate)
         raise HarborError(f"缺少所需命令：{name}")
+
+    @classmethod
+    def command_environment(cls, *names: str) -> Dict[str, str]:
+        """Expose discovered Node/package-manager bins to scripts launched from the app."""
+        env = dict(os.environ)
+        bin_dirs: List[str] = []
+        for name in names:
+            try:
+                bin_dirs.append(str(Path(cls.command_path(name)).resolve().parent))
+            except HarborError:
+                continue
+        existing = env.get("PATH", "")
+        env["PATH"] = os.pathsep.join(dict.fromkeys([*bin_dirs, *existing.split(os.pathsep)]))
+        return env
 
     @staticmethod
     def wechat_cli_path() -> str:
@@ -884,7 +1253,12 @@ class Harbor:
         manager_name = "pnpm" if (target / "pnpm-lock.yaml").is_file() else "npm"
         manager = self.command_path(manager_name)
         try:
-            result = run((manager, "run", script), cwd=target, timeout=300)
+            result = run(
+                (manager, "run", script),
+                cwd=target,
+                timeout=300,
+                env=self.command_environment(manager_name, "node"),
+            )
             if result.code != 0:
                 detail = (result.stderr or result.stdout or "未知错误")[-1200:]
                 raise HarborError(f"{environment_label}环境构建失败：{detail}")
@@ -933,7 +1307,7 @@ class Harbor:
             process_options = {
                 "cwd": str(target), "stdin": subprocess.DEVNULL,
                 "stdout": subprocess.DEVNULL, "stderr": subprocess.DEVNULL,
-                "env": {**os.environ, "BROWSER": "none"},
+                "env": {**self.command_environment(manager_name, "node"), "BROWSER": "none"},
             }
             if IS_WINDOWS:
                 process_options["creationflags"] = subprocess.CREATE_NEW_PROCESS_GROUP
@@ -999,17 +1373,28 @@ class Harbor:
 
     def action(self, payload: Dict[str, object]) -> Dict[str, object]:
         action = str(payload.get("action", ""))
+        if action == "merge_to_test_status":
+            return {"job": self.merge_job_status(str(payload.get("job_id", "")))}
         if action == "check_environment":
             return {"message": "环境检测完成", "environment": self.environment_status()}
         if action == "complete_onboarding":
             return self.complete_onboarding()
         if action == "set_repo_editor":
             return self.set_repo_editor(str(payload.get("repo_id", "")), str(payload.get("editor_id", "")))
+        if action == "set_repo_branches":
+            return self.set_repo_branches(
+                str(payload.get("repo_id", "")),
+                str(payload.get("main_branch", "")),
+                str(payload.get("test_branch", "")),
+            )
         if action == "import_directory":
             selected = self.choose_import_directory()
             if selected is None:
                 return {"message": "已取消导入"}
             return self.import_root(str(selected))
+        if action == "choose_directory":
+            selected = self.choose_import_directory()
+            return {"path": str(selected) if selected is not None else ""}
         if action == "remove_many":
             items = payload.get("items")
             if not isinstance(items, list) or not items or len(items) > 200:
@@ -1045,6 +1430,12 @@ class Harbor:
             pruned = len(prepared) - removed
             detail = f"，并清理 {pruned} 条失效记录" if pruned else ""
             return {"message": f"已删除 {removed} 个工作树{detail}；分支均已保留"}
+
+        if action == "prepare_merge_to_test":
+            return {"plan": self.prepare_merge_to_test(str(payload.get("repo_id", "")), str(payload.get("path", "")))}
+
+        if action == "merge_to_test":
+            return self.start_merge_job(payload)
 
         repo = self.repo(str(payload.get("repo_id", "")))
         if action in {"open_cursor", "open_editor"}:

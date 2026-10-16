@@ -9,9 +9,22 @@ final class WindowDragView: NSView {
     }
 }
 
+final class PasteAwareWebView: WKWebView {
+    override func performKeyEquivalent(with event: NSEvent) -> Bool {
+        let commandPressed = event.modifierFlags.contains(.command)
+        let key = event.charactersIgnoringModifiers?.lowercased()
+        if commandPressed && key == "v" {
+            if tryToPerform(#selector(NSText.paste(_:)), with: nil) {
+                return true
+            }
+        }
+        return super.performKeyEquivalent(with: event)
+    }
+}
+
 final class AppDelegate: NSObject, NSApplicationDelegate, WKNavigationDelegate {
     private var window: NSWindow!
-    private var webView: WKWebView!
+    private var webView: PasteAwareWebView!
     private var serverProcess: Process?
     private var outputPipe: Pipe?
     private var serverURL: URL?
@@ -33,9 +46,10 @@ final class AppDelegate: NSObject, NSApplicationDelegate, WKNavigationDelegate {
     }
 
     private func createWindow() {
+        installEditMenu()
         let configuration = WKWebViewConfiguration()
         configuration.websiteDataStore = .nonPersistent()
-        webView = WKWebView(frame: .zero, configuration: configuration)
+        webView = PasteAwareWebView(frame: .zero, configuration: configuration)
         webView.navigationDelegate = self
         webView.setValue(false, forKey: "drawsBackground")
 
@@ -79,6 +93,21 @@ final class AppDelegate: NSObject, NSApplicationDelegate, WKNavigationDelegate {
         window.center()
         window.makeKeyAndOrderFront(nil)
         showLoading("正在启动本地服务…")
+    }
+
+    private func installEditMenu() {
+        let mainMenu = NSMenu(title: "主菜单")
+        let appMenuItem = NSMenuItem(title: "工作树管家", action: nil, keyEquivalent: "")
+        mainMenu.addItem(appMenuItem)
+        let editMenuItem = NSMenuItem(title: "编辑", action: nil, keyEquivalent: "")
+        let editMenu = NSMenu(title: "编辑")
+        editMenu.addItem(withTitle: "剪切", action: #selector(NSText.cut(_:)), keyEquivalent: "x")
+        editMenu.addItem(withTitle: "复制", action: #selector(NSText.copy(_:)), keyEquivalent: "c")
+        editMenu.addItem(withTitle: "粘贴", action: #selector(NSText.paste(_:)), keyEquivalent: "v")
+        editMenu.addItem(withTitle: "全选", action: #selector(NSText.selectAll(_:)), keyEquivalent: "a")
+        editMenuItem.submenu = editMenu
+        mainMenu.addItem(editMenuItem)
+        NSApp.mainMenu = mainMenu
     }
 
     private func showLoading(_ message: String) {
